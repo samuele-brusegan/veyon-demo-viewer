@@ -70,6 +70,7 @@ class FakeServiceConnection:
         self.ctx = ctx                      # shared ctx: queue eventi, cfg
         self.peer = writer.get_extra_info("peername")
         self.pix_bytes = 4                  # aggiornato da SetPixelFormat
+        self.username = ""
         self._said_monitoring = False
         self._said_fbur = False
 
@@ -139,6 +140,9 @@ class FakeServiceConnection:
         await self.send(vp.build_server_init(self.ctx.fb_width,
                                              self.ctx.fb_height))
         await self.send_async_feature_messages()
+        self.username = username
+        self.ctx.masters[self.peer[0]] = username
+        self.ctx.push("conn", {"ip": self.peer[0], "user": username})
         self.say(f"{self.peer[0]} ora mi vede come un client Veyon online")
 
     # ---- loop running -------------------------------------------------------
@@ -279,6 +283,9 @@ async def handle_client(reader, writer, ctx):
     except Exception:
         log.exception("[%s] errore", conn.peer[0])
     finally:
+        ip = conn.peer[0]
+        if ctx.masters.pop(ip, None) is not None:
+            ctx.push("disc", {"ip": ip})
         try:
             writer.close()
         except Exception:
@@ -295,9 +302,16 @@ class ServiceCtx:
         self.human = human
         self.username = getpass.getuser()
         self.hostname = socket.gethostname()
+        self.masters = {}                    # ip -> username dei master online
+        self.bridge = None                   # queue.Queue opzionale -> GUI
         import time
         self._t0 = time.monotonic()
         self.public_key_pem = self._make_public_key()
+
+    def push(self, kind, payload):
+        """Evento strutturato verso un consumatore esterno (es. la GUI)."""
+        if self.bridge is not None:
+            self.bridge.put((kind, payload))
 
     def uptime(self):
         import time

@@ -70,26 +70,35 @@ class DemoRfbClient(threading.Thread):
 
     def handshake(self):
         s = self.sock
-        recv_exactly(s, 12)                      # server version
+        step = "version"
+        ver = recv_exactly(s, 12)                # server version
+        print(f"    version: {ver!r}", file=sys.stderr, flush=True)
         s.sendall(vp.RFB_VERSION)
+        step = "sectypes"
         n_types = recv_exactly(s, 1)[0]
         types = recv_exactly(s, n_types)
+        print(f"    sectypes: {types!r}", file=sys.stderr, flush=True)
         if vp.SEC_TYPE_VEYON not in types:
             raise RuntimeError(f"security types non supportati: {types!r}")
         s.sendall(bytes([vp.SEC_TYPE_VEYON]))
 
+        step = "auth types"
         payload = recv_vam(s)                    # auth types list
         vals = vp.decode_all(payload)
         if vp.AUTH_TOKEN not in [int(v) for v in vals]:
             raise RuntimeError(f"demo server non offre Token auth: {vals!r}")
         s.sendall(vp.pack_vam(vp.AUTH_TOKEN, ""))
+        step = "auth ack"
         recv_vam(s)                              # auth ack (vuota)
+        step = "token"
         s.sendall(vp.pack_vam(self.token))       # il token demo
         (result,) = struct.unpack(">I", recv_exactly(s, 4))
         if result != vp.AUTH_OK:
             raise RuntimeError(f"token rifiutato (result={result})")
 
+        step = "ClientInit"
         s.sendall(b"\x01")                       # ClientInit (shared)
+        step = "ServerInit"
         init = recv_exactly(s, 24)
         w, h = struct.unpack(">HH", init[:4])
         (name_len,) = struct.unpack(">I", init[20:24])
