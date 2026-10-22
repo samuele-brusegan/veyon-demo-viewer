@@ -105,8 +105,12 @@ class DemoRfbClient(threading.Thread):
                 vp.ENC_NEW_FB_SIZE, vp.ENC_LAST_RECT]
         s.sendall(struct.pack(">BxH", vp.CMSG_SET_ENCODINGS, len(encs)) +
                   struct.pack(f">{len(encs)}I", *encs))
-        # stream zlib persistenti del Tight (4 slot, resettabili dal server)
+        # stream zlib persistenti del Tight (4 slot, resettabili dal server);
+        # tight_bad = stream "avvelenato" (join a meta' stream): si saltano
+        # i suoi chunk finche' l'encoder non emette un reset flag
         self.tight_zs = [zlib.decompressobj() for _ in range(4)]
+        self.tight_bad = [False] * 4
+        self.rects_seen = 0
         self.request_update(False)
 
     def request_update(self, incremental):
@@ -134,6 +138,10 @@ class DemoRfbClient(threading.Thread):
         for _ in range(n):
             x, y, rw, rh, enc = struct.unpack(">HHHHi", recv_exactly(s, 12))
             enc &= 0xFFFFFFFF
+            if self.rects_seen < 8:
+                print(f"  rect enc={enc:#x} {x},{y} {rw}x{rh}",
+                      file=sys.stderr, flush=True)
+            self.rects_seen += 1
             if enc == vp.ENC_LAST_RECT:
                 return
             if enc == vp.ENC_RAW:
@@ -155,6 +163,13 @@ class DemoRfbClient(threading.Thread):
                 (ns,) = struct.unpack("B", recv_exactly(s, 1))
                 recv_exactly(s, ns * 16)
                 self.resize_fb(rw, rh)
+            elif enc == vp.ENC_POINTER_POS:
+                pass
+            elif enc in (vp.ENC_XCURSOR, vp.ENC_RICH_CURSOR):
+                # pixel 4B/px + bitmask 1bpp
+                recv_exactly(s, rw * rh * 4 + (rw * rh + 7) // 8)
+            elif 0xFFFFFFE0 <= enc <= 0xFFFFFFE9:
+                pass                                 # quality level, info only
             else:
                 raise RuntimeError(f"encoding non gestito: {enc:#x} "
                                    f"rect {x},{y} {rw}x{rh}")
@@ -168,6 +183,7 @@ class DemoRfbClient(threading.Thread):
         for i in range(4):
             if ctl & (1 << i):
                 self.tight_zs[i] = zlib.decompressobj()
+                self.tight_bad[i] = False
         ctl >>= 4
         uncompressed = False
         if (ctl & 0x0A) == 0x0A:                     # rfbTightNoZlib
@@ -203,8 +219,20 @@ class DemoRfbClient(threading.Thread):
             data = recv_exactly(s, size)
         else:
             payload = recv_exactly(s, read_compact_len(s))
-            data = payload if uncompressed \
-                else self.tight_zs[ctl & 0x03].decompress(payload)
+            sid = ctl & 0x03
+            if uncompressed:
+                data = payload
+            elif self.tight_bad[sid]:
+                return           # chunk di meta' stream: non decodificabile
+            else:
+                try:
+                    data = self.tight_zs[sid].decompress(payload)
+                except zlib.error:
+                    self.tight_bad[sid] = True
+                    print(f"  tight: stream {sid} senza history "
+                          f"(join a meta' stream), rect {x},{y} {w}x{h} saltato",
+                          file=sys.stderr, flush=True)
+                    return
         if len(data) < size:
             raise RuntimeError(f"tight: dati corti {len(data)}/{size}B")
         self.apply_tight_filter(mode, palette, bits, x, y, w, h, data[:size])
@@ -247,10 +275,10 @@ class DemoRfbClient(threading.Thread):
             raise RuntimeError("tight: JPEG non decodificabile")
         ch, rs = pb.get_n_channels(), pb.get_rowstride()
         pw, ph = pb.get_width(), pb.get_height()
-        arr = np.frombuffer(pb.get_pixels(), np.uint8) \
-            .reshape(ph, rs)[:, :pw * ch].reshape(ph, pw, ch)
+        raw = np.frombuffer(pb.get_pixels(), np.uint8)
+        arr = np.lib.stride_tricks.as_strided(raw, (ph, pw, ch), (rs, ch, 1))
         self.fb[y:y + ph, x:x + pw] = arr[:, :, :3] if ch >= 3 \
-            else np.repeat(arr, 3, axis=2)
+            else np.repeat(arr[:, :, :1], 3, axis=2)
 
     def resize_fb(self, w, h):
         new = np.zeros((h, w, 3), dtype=np.uint8)
