@@ -121,6 +121,11 @@ async def mock_master(events):
     await reader.readexactly(name_len)
     check("master: ServerInit", len(init) == 24)
 
+    # async feature messages post-connect (user/session/screens)
+    for _ in range(3):
+        assert (await reader.readexactly(1))[0] == vp.MSG_FEATURE
+        await read_vam_r(reader)
+
     # monitoring: FBUR non incrementale -> rect nero
     writer.write(struct.pack(">BBHHHH", vp.CMSG_FB_UPDATE_REQ, 0,
                              0, 0, 16, 16))
@@ -130,6 +135,15 @@ async def mock_master(events):
     (n,) = struct.unpack(">xH", hdr)
     check("master: FB update", mtype == vp.MSG_FB_UPDATE and n == 1)
     await reader.readexactly(12 + 16 * 16 * 4)
+
+    # ping -> echo
+    ping = vp.FeatureMessage(vp.UID_MONITORING, 0, {})
+    writer.write(ping.serialize_rfb())
+    await writer.drain()
+    assert (await reader.readexactly(1))[0] == vp.MSG_FEATURE
+    payload = await read_vam_r(reader)
+    echo = vp.FeatureMessage.parse(payload)
+    check("master: ping echo", echo.uid == vp.UID_MONITORING)
 
     # StartDemoClient (window) con host vuoto -> il servizio usa il peer
     fm = vp.FeatureMessage(vp.DEMO_UID_WINDOW, vp.CMD_START_DEMO_CLIENT, {
@@ -141,10 +155,15 @@ async def mock_master(events):
     writer.write(fm.serialize_rfb())
     await writer.drain()
 
+    got = None
     try:
-        got, peer = await asyncio.wait_for(events.get(), 5)
+        while True:
+            msg, peer = await asyncio.wait_for(events.get(), 5)
+            if msg.uid in vp.DEMO_UIDS:
+                got = msg
+                break
     except asyncio.TimeoutError:
-        got = None
+        pass
     check("master: StartDemoClient catturato",
           got is not None and got.command == vp.CMD_START_DEMO_CLIENT
           and got.args.get(vp.ARG_DEMO_ACCESS_TOKEN) == TOKEN)

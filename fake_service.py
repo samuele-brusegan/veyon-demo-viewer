@@ -10,8 +10,10 @@ Oppure via veyondemo.py che spawna anche il viewer.
 
 import argparse
 import asyncio
+import getpass
 import logging
 import secrets
+import socket
 import struct
 
 import veyon_proto as vp
@@ -117,6 +119,7 @@ class FakeServiceConnection:
         await _read_exactly(self.reader, 1)          # ClientInit
         await self.send(vp.build_server_init(self.ctx.fb_width,
                                              self.ctx.fb_height))
+        await self.send_async_feature_messages()
 
     # ---- loop running -------------------------------------------------------
 
@@ -130,7 +133,64 @@ class FakeServiceConnection:
                         self.peer[0], e, payload[:200].hex())
             return
         log.info("[%s] %s", self.peer[0], fm)
+
+        reply = self.feature_reply(fm)
+        if reply is not None:
+            await self.send(reply)
+
         await self.ctx.events.put((fm, self.peer[0]))
+
+    def feature_reply(self, fm):
+        """Risposte alle feature builtin, come farebbe il vero servizio."""
+        if fm.uid == vp.UID_MONITORING:
+            # Ping: il vero servizio risponde con lo stesso messaggio
+            return fm.serialize_rfb()
+        if fm.uid == vp.UID_QUERY_APP_VERSION:
+            return vp.FeatureMessage(fm.uid, 0,
+                                     {vp.ARG_APPLICATION_VERSION: 9}
+                                     ).serialize_rfb()
+        if fm.uid == vp.UID_QUERY_ACTIVE_FEATURES:
+            return vp.FeatureMessage(fm.uid, 0,
+                                     {vp.ARG_ACTIVE_FEATURES: []}
+                                     ).serialize_rfb()
+        if fm.uid == vp.UID_QUERY_USER_INFO:
+            return self.user_info_msg()
+        if fm.uid == vp.UID_QUERY_SESSION_INFO:
+            return self.session_info_msg()
+        if fm.uid == vp.UID_QUERY_SCREENS:
+            return self.screens_msg()
+        return None
+
+    def user_info_msg(self):
+        user = self.ctx.username
+        return vp.FeatureMessage(vp.UID_QUERY_USER_INFO, 0, {
+            vp.ARG_USER_LOGIN_NAME: user,
+            vp.ARG_USER_FULL_NAME: user,
+        }).serialize_rfb()
+
+    def session_info_msg(self):
+        return vp.FeatureMessage(vp.UID_QUERY_SESSION_INFO, 0, {
+            vp.ARG_SESSION_ID: 0,
+            vp.ARG_SESSION_UPTIME: int(self.ctx.uptime()),
+            vp.ARG_SESSION_HOSTNAME: self.ctx.hostname,
+            vp.ARG_SESSION_CLIENT_ADDRESS: "",
+            vp.ARG_SESSION_CLIENT_NAME: "",
+            vp.ARG_SESSION_METADATA: "",
+        }).serialize_rfb()
+
+    def screens_msg(self):
+        return vp.FeatureMessage(vp.UID_QUERY_SCREENS, 0, {
+            vp.ARG_SCREEN_INFO_LIST: [{
+                "name": "Screen 1",
+                "geometry": vp.Rect(0, 0, self.ctx.fb_width, self.ctx.fb_height),
+            }],
+        }).serialize_rfb()
+
+    async def send_async_feature_messages(self):
+        """Come il vero servizio: dopo il sync spinge user/session/screens."""
+        await self.send(self.user_info_msg())
+        await self.send(self.session_info_msg())
+        await self.send(self.screens_msg())
 
     async def handle_fbur(self, msg):
         incremental, x, y, w, h = struct.unpack(">BHHHH", msg)
@@ -195,7 +255,15 @@ class ServiceCtx:
         self.fb_width = fb_width
         self.fb_height = fb_height
         self.verbose = verbose
+        self.username = getpass.getuser()
+        self.hostname = socket.gethostname()
+        import time
+        self._t0 = time.monotonic()
         self.public_key_pem = self._make_public_key()
+
+    def uptime(self):
+        import time
+        return time.monotonic() - self._t0
 
     @staticmethod
     def _make_public_key():
