@@ -121,6 +121,8 @@ class DemoRfbClient(threading.Thread):
             elif enc == vp.ENC_ZLIB:
                 (ln,) = struct.unpack(">I", recv_exactly(s, 4))
                 data = zlib.decompress(recv_exactly(s, ln))
+                print(f"  zlib rect {x},{y} {rw}x{rh}: {ln}B -> {len(data)}B",
+                      file=sys.stderr, flush=True)
                 self.blit(x, y, rw, rh, data)
             elif enc == vp.ENC_COPYRECT:
                 sx, sy = struct.unpack(">HH", recv_exactly(s, 4))
