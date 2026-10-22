@@ -53,6 +53,16 @@ def decode_vam(payload):
         raise
 
 
+FEATURE_NAMES = {
+    vp.UID_MONITORING: "monitoring/keepalive",
+    vp.UID_QUERY_APP_VERSION: "richiesta versione applicazione",
+    vp.UID_QUERY_ACTIVE_FEATURES: "richiesta feature attive",
+    vp.UID_QUERY_USER_INFO: "richiesta informazioni utente",
+    vp.UID_QUERY_SESSION_INFO: "richiesta informazioni sessione",
+    vp.UID_QUERY_SCREENS: "richiesta schermi disponibili",
+}
+
+
 class FakeServiceConnection:
     def __init__(self, reader, writer, ctx):
         self.reader = reader
@@ -60,6 +70,12 @@ class FakeServiceConnection:
         self.ctx = ctx                      # shared ctx: queue eventi, cfg
         self.peer = writer.get_extra_info("peername")
         self.pix_bytes = 4                  # aggiornato da SetPixelFormat
+        self._said_monitoring = False
+        self._said_fbur = False
+
+    def say(self, msg):
+        if self.ctx.human:
+            print(f"  {msg}", flush=True)
 
     async def send(self, data):
         self.writer.write(data)
@@ -96,6 +112,8 @@ class FakeServiceConnection:
         username = str(vals[1]) if len(vals) > 1 else ""
         log.info("[%s] auth type scelto: %s, user=%r", self.peer[0],
                  AUTH_NAMES.get(auth_type, auth_type), username)
+        self.say(f"{username or '?'} ({self.peer[0]}) si sta autenticando "
+                 f"con metodo {AUTH_NAMES.get(auth_type, auth_type)}")
 
         await self.send(vp.EMPTY_VAM)  # auth ack
 
@@ -121,6 +139,7 @@ class FakeServiceConnection:
         await self.send(vp.build_server_init(self.ctx.fb_width,
                                              self.ctx.fb_height))
         await self.send_async_feature_messages()
+        self.say(f"{self.peer[0]} ora mi vede come un client Veyon online")
 
     # ---- loop running -------------------------------------------------------
 
@@ -138,6 +157,18 @@ class FakeServiceConnection:
         reply = self.feature_reply(fm)
         if reply is not None:
             await self.send(reply)
+
+        if fm.uid in vp.DEMO_UIDS:
+            pass                      # narrato da veyondemo (che lancia il viewer)
+        elif fm.uid == vp.UID_MONITORING and fm.command == 0:
+            pass                      # keepalive, troppo frequente per narrarlo
+        elif fm.uid in FEATURE_NAMES and not self._said_monitoring:
+            self._said_monitoring = True
+            self.say(f"{self.peer[0]} mi ha chiesto le info di base "
+                     "(utente, sessione, schermi) — risposto come un client normale")
+        elif fm.uid not in FEATURE_NAMES:
+            self.say(f"{self.peer[0]} mi ha inviato un comando "
+                     f"(feature {fm.uid}, cmd {fm.command}) — ignorato")
 
         await self.ctx.events.put((fm, self.peer[0]))
 
@@ -199,6 +230,10 @@ class FakeServiceConnection:
             await self.send(vp.build_empty_fb_update())
         else:
             await self.send(vp.build_fb_update_raw(x, y, w, h, self.pix_bytes))
+        if not self._said_fbur:
+            self._said_fbur = True
+            self.say(f"{self.peer[0]} sta guardando l'anteprima del mio "
+                     "schermo — gli servo un'immagine nera")
 
     async def run(self):
         await self.handshake()
@@ -251,11 +286,13 @@ async def handle_client(reader, writer, ctx):
 
 
 class ServiceCtx:
-    def __init__(self, events, fb_width=1024, fb_height=768, verbose=False):
+    def __init__(self, events, fb_width=1024, fb_height=768, verbose=False,
+                 human=False):
         self.events = events               # asyncio.Queue
         self.fb_width = fb_width
         self.fb_height = fb_height
         self.verbose = verbose
+        self.human = human
         self.username = getpass.getuser()
         self.hostname = socket.gethostname()
         import time
