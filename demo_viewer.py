@@ -17,7 +17,8 @@ import numpy as np
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
 import veyon_proto as vp
 
@@ -30,6 +31,19 @@ def recv_exactly(sock, n):
             raise ConnectionError("connessione chiusa dal server")
         buf += chunk
     return bytes(buf)
+
+
+def read_compact_len(sock):
+    """Lunghezza compressa Tight: varint a 7 bit su 1-3 byte."""
+    b = recv_exactly(sock, 1)[0]
+    ln = b & 0x7F
+    if b & 0x80:
+        b = recv_exactly(sock, 1)[0]
+        ln |= (b & 0x7F) << 7
+        if b & 0x80:
+            b = recv_exactly(sock, 1)[0]
+            ln |= (b & 0xFF) << 14
+    return ln
 
 
 def recv_vam(sock):
@@ -80,12 +94,19 @@ class DemoRfbClient(threading.Thread):
         self.fb = np.zeros((h, w, 3), dtype=np.uint8)
         GLib.idle_add(self.app.set_size, w, h)
 
-        # pixel format: 24bpp, LE, truecolour, r/g/bshift -> bytes R,G,B
-        pf = struct.pack(">BBBBHHHBBBxxx", 24, 24, 0, 1,
-                         255, 255, 255, 0, 8, 16)
+        # pixel format dichiarato (il demo server lo ignora: broadcasta sempre
+        # 32bpp depth24 R16/G8/B0 LE, vedi DemoServer::setVncServerPixelFormat)
+        pf = struct.pack(">BBBBHHHBBBxxx", 32, 24, 0, 1,
+                         255, 255, 255, 16, 8, 0)
         s.sendall(bytes([vp.CMSG_SET_PIXEL_FORMAT]) + b"\x00" * 3 + pf)
-        s.sendall(struct.pack(">BxH", vp.CMSG_SET_ENCODINGS, 2) +
-                  struct.pack(">2i", vp.ENC_RAW, vp.ENC_COPYRECT))
+        encs = [vp.ENC_TIGHT, vp.ENC_ZYWRLE, vp.ENC_ZRLE, vp.ENC_ULTRA,
+                vp.ENC_COPYRECT, vp.ENC_HEXTILE, vp.ENC_CORRE, vp.ENC_RRE,
+                vp.ENC_RAW, vp.ENC_ZLIB,
+                vp.ENC_NEW_FB_SIZE, vp.ENC_LAST_RECT]
+        s.sendall(struct.pack(">BxH", vp.CMSG_SET_ENCODINGS, len(encs)) +
+                  struct.pack(f">{len(encs)}I", *encs))
+        # stream zlib persistenti del Tight (4 slot, resettabili dal server)
+        self.tight_zs = [zlib.decompressobj() for _ in range(4)]
         self.request_update(False)
 
     def request_update(self, incremental):
@@ -116,24 +137,120 @@ class DemoRfbClient(threading.Thread):
             if enc == vp.ENC_LAST_RECT:
                 return
             if enc == vp.ENC_RAW:
-                data = recv_exactly(s, rw * rh * 3)
+                data = recv_exactly(s, rw * rh * 4)
                 self.blit(x, y, rw, rh, data)
             elif enc == vp.ENC_ZLIB:
                 (ln,) = struct.unpack(">I", recv_exactly(s, 4))
-                data = zlib.decompress(recv_exactly(s, ln))
-                print(f"  zlib rect {x},{y} {rw}x{rh}: {ln}B -> {len(data)}B",
-                      file=sys.stderr, flush=True)
-                self.blit(x, y, rw, rh, data)
+                self.blit(x, y, rw, rh, zlib.decompress(recv_exactly(s, ln)))
+            elif enc == vp.ENC_TIGHT:
+                self.read_tight_rect(x, y, rw, rh)
             elif enc == vp.ENC_COPYRECT:
                 sx, sy = struct.unpack(">HH", recv_exactly(s, 4))
                 self.fb[y:y + rh, x:x + rw] = self.fb[sy:sy + rh, sx:sx + rw]
-            elif enc in (0xFFFFFFB1, 0xFFFFFFB2):      # SupportedMessages/Encodings
+            elif enc in (vp.ENC_SUPPORTED_MESSAGES, vp.ENC_SUPPORTED_ENCODINGS):
                 recv_exactly(s, rw)                    # w = byte count
-            elif enc in (0xFFFFFF21, 0xFFFFFF15):      # DesktopSize variants
+            elif enc == vp.ENC_NEW_FB_SIZE:
+                self.resize_fb(rw, rh)
+            elif enc == vp.ENC_EXT_DESKTOP_SIZE:
+                (ns,) = struct.unpack("B", recv_exactly(s, 1))
+                recv_exactly(s, ns * 16)
                 self.resize_fb(rw, rh)
             else:
                 raise RuntimeError(f"encoding non gestito: {enc:#x} "
                                    f"rect {x},{y} {rw}x{rh}")
+
+    # -- Tight (encoding 7) ---------------------------------------------------
+
+    def read_tight_rect(self, x, y, w, h):
+        """Decode di un rect Tight (libvncclient tight.c, solo TPIXEL 24bit)."""
+        s = self.sock
+        ctl = recv_exactly(s, 1)[0]
+        for i in range(4):
+            if ctl & (1 << i):
+                self.tight_zs[i] = zlib.decompressobj()
+        ctl >>= 4
+        uncompressed = False
+        if (ctl & 0x0A) == 0x0A:                     # rfbTightNoZlib
+            uncompressed = True
+            ctl &= ~0x0A
+        if ctl == 0x08:                              # rfbTightFill
+            r, g, b = recv_exactly(s, 3)
+            self.fb[y:y + h, x:x + w] = (r, g, b)
+            return
+        if ctl == 0x09:                              # rfbTightJpeg
+            self.blit_jpeg(x, y, w, h,
+                           recv_exactly(s, read_compact_len(s)))
+            return
+        if ctl > 0x0A:
+            raise RuntimeError(f"tight: subencoding {ctl} non valido")
+
+        mode, bits, palette = "copy", 24, None
+        if ctl & 0x04:                               # filtro esplicito
+            fid = recv_exactly(s, 1)[0]
+            if fid == 1:                             # palette
+                n = recv_exactly(s, 1)[0] + 1
+                palette = np.frombuffer(recv_exactly(s, n * 3),
+                                        np.uint8).reshape(n, 3).copy()
+                mode, bits = "palette", 1 if n == 2 else 8
+            elif fid == 2:
+                mode = "gradient"
+            elif fid != 0:
+                raise RuntimeError(f"tight: filtro {fid} sconosciuto")
+
+        row_size = (w * bits + 7) // 8
+        size = row_size * h
+        if size < 12:                                # TIGHT_MIN_TO_COMPRESS
+            data = recv_exactly(s, size)
+        else:
+            payload = recv_exactly(s, read_compact_len(s))
+            data = payload if uncompressed \
+                else self.tight_zs[ctl & 0x03].decompress(payload)
+        if len(data) < size:
+            raise RuntimeError(f"tight: dati corti {len(data)}/{size}B")
+        self.apply_tight_filter(mode, palette, bits, x, y, w, h, data[:size])
+
+    def apply_tight_filter(self, mode, palette, bits, x, y, w, h, data):
+        if mode == "copy":
+            self.fb[y:y + h, x:x + w] = \
+                np.frombuffer(data, np.uint8).reshape(h, w, 3)
+        elif mode == "palette":
+            if bits == 1:
+                idx = np.unpackbits(
+                    np.frombuffer(data, np.uint8).reshape(h, -1),
+                    axis=1)[:, :w]
+            else:
+                idx = np.frombuffer(data, np.uint8).reshape(h, w)
+            self.fb[y:y + h, x:x + w] = palette[idx]
+        else:                                        # gradient
+            src = np.frombuffer(data, np.uint8) \
+                .reshape(h, w, 3).astype(np.int16)
+            out = np.empty((h, w, 3), np.uint8)
+            prev = np.zeros((w, 3), np.int16)
+            for yy in range(h):
+                row = np.empty((w, 3), np.int16)
+                pix = (prev[0] + src[yy, 0]) & 0xFF
+                row[0] = pix
+                for xx in range(1, w):
+                    est = np.clip(prev[xx] + pix - prev[xx - 1], 0, 255)
+                    pix = (est + src[yy, xx]) & 0xFF
+                    row[xx] = pix
+                out[yy] = row
+                prev = row
+            self.fb[y:y + h, x:x + w] = out
+
+    def blit_jpeg(self, x, y, w, h, data):
+        loader = GdkPixbuf.PixbufLoader.new_with_type("jpeg")
+        loader.write(data)
+        loader.close()
+        pb = loader.get_pixbuf()
+        if pb is None:
+            raise RuntimeError("tight: JPEG non decodificabile")
+        ch, rs = pb.get_n_channels(), pb.get_rowstride()
+        pw, ph = pb.get_width(), pb.get_height()
+        arr = np.frombuffer(pb.get_pixels(), np.uint8) \
+            .reshape(ph, rs)[:, :pw * ch].reshape(ph, pw, ch)
+        self.fb[y:y + ph, x:x + pw] = arr[:, :, :3] if ch >= 3 \
+            else np.repeat(arr, 3, axis=2)
 
     def resize_fb(self, w, h):
         new = np.zeros((h, w, 3), dtype=np.uint8)
@@ -153,6 +270,7 @@ class DemoRfbClient(threading.Thread):
             if mtype == vp.MSG_FB_UPDATE:
                 (n,) = struct.unpack(">xH", recv_exactly(s, 3))
                 self.read_rects(n)
+                self.frames += 1
                 GLib.idle_add(self.app.refresh, self.fb)
                 self.request_update(True)
             elif mtype == vp.MSG_SET_COLOURMAP:
@@ -184,11 +302,14 @@ class DemoRfbClient(threading.Thread):
                 self.sock.settimeout(None)
                 print("  handshake...", file=sys.stderr, flush=True)
                 self.handshake()
+                self.frames = 0
                 print("  auth OK, streaming", file=sys.stderr, flush=True)
                 GLib.idle_add(self.app.set_status, "connesso")
                 self.serve()
             except Exception as e:
-                print(f"  errore: {e!r}", file=sys.stderr, flush=True)
+                note = " (resync del server: riavvio globale atteso)" \
+                    if getattr(self, "frames", 0) == 0 else ""
+                print(f"  errore: {e!r}{note}", file=sys.stderr, flush=True)
                 GLib.idle_add(self.app.set_status, f"disconnesso: {e} — riprovo")
             finally:
                 if self.sock:

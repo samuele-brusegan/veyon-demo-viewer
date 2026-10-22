@@ -73,11 +73,59 @@ Stesso handshake Veyon; `supportedAuthTypes = [Token=5]`:
 2. server → VAM `[Int 1][Token]`; noi → VAM `[Token, ""]`
 3. server → VAM vuota (ack); stato auth Init→Token senza messaggi
 4. noi → VAM `[token bytearray]`; server → `u32be 0` (rfbVncAuthOK)
-5. noi → ClientInit 1B; server → ServerInit
-6. RFB running: mandiamo SetPixelFormat (32bpp truecolor BGRX),
-   SetEncodings `[raw=0, copyrect=1]`, FBUR non-incrementale poi
-   incrementale in loop; decodiamo rect raw/copyrect (+pseudo
-   LastRect=0xffffffe0 come terminatore, DesktopSize/pseudo ignorati).
+5. noi → ClientInit 1B; server → ServerInit (è quello del backend VNC:
+   fb size/formato reali del demo server, non quelli che chiediamo)
+6. RFB running: SetPixelFormat + SetEncodings vengono **letti e ignorati**
+   dal demo server (DemoServerConnection::receiveClientMessage). Il
+   formato effettivo dello stream è quello che il demo server chiede al
+   backend: 32bpp, depth 24, max 255, shift R16/G8/B0, little-endian
+   → raw = 4B/px B,G,R,X. Il client ufficiale chiede lo stesso formato.
+7. Il server risponde a FBUR con **tutto il backlog** di FBU pre-encodati
+   (broadcast uguale per tutti i client), non con un FBU nuovo.
+
+### Encodings effettivi
+
+Il demo server chiede al backend, in ordine: Tight(7), ZYWRLE(17),
+ZRLE(16), Ultra(9), CopyRect(1), Hextile(5), CoRRE(4), RRE(2), Raw(0) +
+CompressLevel9, QualityLevel(q), NewFBSize(0xffffff21), LastRect
+(0xffffffe0). Backend tipici (UltraVNC/x11vnc) scelgono **Tight**, spesso
+con JPEG per il desktop (quality adjust adattivo in base alla banda).
+
+### Tight (encoding 7) — decode implementato
+
+Per rect: 1B compression-control. Bit 0-3 = reset degli stream zlib 0-3
+(stream **persistenti** tra rect); poi ctl>>=4:
+
+- `0x08` fill: 3B RGB, rect a tinta unita
+- `0x09` JPEG: compact-len + dati JPEG
+- `0x0A` (maschera su ctl): flag "nessun zlib" → dati raw con compact-len
+- `0x04` filtro esplicito: 1B filter-id (0=copy, 1=palette, 2=gradient)
+- `ctl & 0x03` = stream id zlib
+
+Palette: 1B (nColori-1) + nColori*3B RGB; indice 1 bit/px se 2 colori
+altrimenti 8 bit/px. Gradient: predizione `prevRow + left - prevLeft`
+clampata 0-255 su 3B/px. Dati < `rh*rowSize` < 12B viaggiano in chiaro
+senza lunghezza; altrimenti compact-len (varint 7bit, 1-3B) + zlib/raw.
+TPIXEL: con 32bpp/depth24 i pixel sono 3B RGB ("cutZeros").
+
+### synchronizationLost / restart globale
+
+Ogni client ha `fbuSequenceNumber` = prossimo msg FBU atteso; il server
+scarta i msg consumati da tutti e più vecchi di 10s (MinAge), MaxAge 20s.
+Un client che si unisce a demo avviata ha seq 0: se il server ha già
+scartato messaggi (fbuSeq>0) il primo FBUR dà offset<0 →
+`synchronizationLost` → `reconnectToVncServer()`: **chiusura di TUTTE le
+connessioni** e reset coda/epoch. Anche non inviare FBUR blocca gli
+scarti (lowest=0) e al MaxAge scatta il restart comunque — un late-joiner
+causa sempre un resync (anche un PC ufficiale che si accende a demo
+avviata). Dopo il restart la coda riparte da seq 0: riconnettersi entro
+~10s = join pulito. I reset ripetuti del nostro viewer erano causati dal
+decode errato (zlib al posto di Tight) che chiudeva lo stream e
+reinnescava il loop.
+
+Tipi di messaggio client→server accettati: SetPixelFormat(0),
+SetEncodings(2), FBUR(3), KeyEvent(4), PointerEvent(5),
+FeatureMessage(41). Qualsiasi altro tipo → chiusura connessione.
 
 ## Note operative
 

@@ -9,13 +9,16 @@ Uso: python3 test_e2e.py
 """
 
 import asyncio
+import socket
 import struct
 import sys
 import uuid
+import zlib
 
 import numpy as np
 
 import veyon_proto as vp
+import demo_viewer
 from fake_service import ServiceCtx, handle_client
 
 SVC_PORT = 21100
@@ -30,6 +33,45 @@ def check(name, cond):
 
 
 # ---------------------------------------------------------------- mock demo server
+
+def pack_compact_len(n):
+    if n < 0x80:
+        return bytes([n])
+    if n < 0x4000:
+        return bytes([0x80 | (n & 0x7F), n >> 7])
+    return bytes([0x80 | (n & 0x7F), 0x80 | ((n >> 7) & 0x7F), n >> 14])
+
+
+def tight_rect(x, y, w, h, body):
+    return struct.pack(">HHHHi", x, y, w, h, vp.ENC_TIGHT) + body
+
+
+def build_tight_fbu(w, h):
+    """FBU con 4 rect Tight: copy+zlib, fill, palette 2 colori, copy raw."""
+    rects = b""
+
+    # 1) copy filter, stream zlib 0 (reset flag): intero framebuffer RGB
+    fb = np.zeros((h, w, 3), np.uint8)
+    fb[:, :, 0] = np.arange(w, dtype=np.uint8)[None, :]
+    payload = zlib.compress(fb.tobytes())
+    rects += tight_rect(0, 0, w, h,
+                        b"\x01" + pack_compact_len(len(payload)) + payload)
+
+    # 2) fill rect rosso 10x10
+    rects += tight_rect(0, 0, 10, 10, b"\x80" + bytes([255, 0, 0]))
+
+    # 3) palette 2 colori 8x8 (righe alternate), filtro esplicito + reset
+    pal = bytes([0, 0, 0, 255, 255, 255])
+    rows = bytes([0xAA, 0x55] * 4)
+    rects += tight_rect(10, 10, 8, 8,
+                        b"\x41" + b"\x01" + b"\x01" + pal + rows)
+
+    # 4) copy raw (<12B): 3x1 con pixel 1..9
+    rects += tight_rect(30, 30, 3, 1,
+                        b"\x01" + bytes([1, 2, 3, 4, 5, 6, 7, 8, 9]))
+
+    return struct.pack(">BxH", vp.MSG_FB_UPDATE, 4) + rects
+
 
 async def mock_demo_server(reader, writer):
     writer.write(vp.RFB_VERSION)
@@ -67,14 +109,7 @@ async def mock_demo_server(reader, writer):
                 req = await reader.readexactly(9)
                 incremental, x, y, w, h = struct.unpack(">BHHHH", req)
                 frame_no += 1
-                # pattern: sfondo a gradiente + barra che si sposta
-                fb = np.zeros((h, w, 3), np.uint8)
-                fb[:, :, 0] = np.arange(w, dtype=np.uint8)[None, :]
-                pos = frame_no % max(1, w - 40)
-                fb[:, pos:pos + 40] = (255, 0, 0)
-                rect = struct.pack(">BxH", vp.MSG_FB_UPDATE, 1) + \
-                    struct.pack(">HHHHi", x, y, w, h, vp.ENC_RAW) + fb.tobytes()
-                writer.write(rect)
+                writer.write(build_tight_fbu(w, h))
                 await writer.drain()
             else:
                 break
@@ -173,44 +208,36 @@ async def mock_master(events):
     return got
 
 
-# ---------------------------------------------------------------- mock demo client (come demo_viewer, no GUI)
+# ------------------------------------------------- mock demo client (vero decoder)
 
-async def mock_demo_client():
-    reader, writer = await asyncio.open_connection("127.0.0.1", DEMO_PORT)
-    assert await reader.readexactly(12) == vp.RFB_VERSION
-    writer.write(vp.RFB_VERSION)
-    await writer.drain()
-    n = (await reader.readexactly(1))[0]
-    await reader.readexactly(n)
-    writer.write(bytes([vp.SEC_TYPE_VEYON]))
-    await writer.drain()
-    payload = await read_vam_r(reader)                        # [Token]
-    writer.write(vp.pack_vam(vp.AUTH_TOKEN, ""))
-    await writer.drain()
-    await read_vam_r(reader)                                  # ack
-    writer.write(vp.pack_vam(TOKEN))
-    await writer.drain()
-    (res,) = struct.unpack(">I", await reader.readexactly(4))
-    check("demo client: auth OK", res == vp.AUTH_OK)
+class DummyApp:
+    closed = False
+    def set_size(self, w, h): pass
+    def set_status(self, t): pass
+    def refresh(self, fb): pass
 
-    writer.write(b"\x01")
-    init = await reader.readexactly(24)
-    w, h = struct.unpack(">HH", init[:4])
-    (nl,) = struct.unpack(">I", init[20:24])
-    await reader.readexactly(nl)
-    check("demo client: ServerInit", (w, h) == (FB_W, FB_H))
 
-    writer.write(struct.pack(">BBHHHH", vp.CMSG_FB_UPDATE_REQ, 0, 0, 0, w, h))
-    await writer.drain()
-    mtype = (await reader.readexactly(1))[0]
-    (nrects,) = struct.unpack(">xH", await reader.readexactly(3))
-    x, y, rw, rh, enc = struct.unpack(">HHHHi", await reader.readexactly(12))
-    data = await reader.readexactly(rw * rh * 3)
-    fb = np.frombuffer(data, np.uint8).reshape(rh, rw, 3)
-    check("demo client: frame raw decodificato",
-          mtype == 0 and nrects == 1 and rw == w and rh == h
-          and int(fb[50, 100, 0]) == 100)
-    writer.close()
+def mock_demo_client():
+    c = demo_viewer.DemoRfbClient("127.0.0.1", DEMO_PORT, TOKEN, DummyApp())
+    c.sock = socket.create_connection(("127.0.0.1", DEMO_PORT), 5)
+    c.handshake()
+    check("demo client: auth+ServerInit", c.fb_size == (FB_W, FB_H))
+
+    # handshake ha gia' inviato il FBUR: leggiamo un FBU col decoder vero
+    mtype = demo_viewer.recv_exactly(c.sock, 1)[0]
+    (nrects,) = struct.unpack(">xH", demo_viewer.recv_exactly(c.sock, 3))
+    c.read_rects(nrects)
+    fb = c.fb
+    check("tight copy+zlib", int(fb[50, 100, 0]) == 100)
+    check("tight fill", tuple(fb[5, 5]) == (255, 0, 0))
+    check("tight palette",
+          tuple(fb[10, 10]) == (255, 255, 255)
+          and tuple(fb[10, 11]) == (0, 0, 0)
+          and tuple(fb[11, 10]) == (0, 0, 0)
+          and tuple(fb[11, 11]) == (255, 255, 255))
+    check("tight copy raw",
+          tuple(fb[30, 30]) == (1, 2, 3) and tuple(fb[30, 32]) == (7, 8, 9))
+    c.sock.close()
 
 
 # ---------------------------------------------------------------- main
@@ -228,7 +255,7 @@ async def main():
         port = fm.args.get(vp.ARG_DEMO_SERVER_PORT)
         token = fm.args.get(vp.ARG_DEMO_ACCESS_TOKEN)
         check("demo args", port == DEMO_PORT and token == TOKEN)
-        await mock_demo_client()
+        await asyncio.to_thread(mock_demo_client)
 
     svc.close(); demo.close()
     failed = [n for n, c in passed if not c]
