@@ -251,6 +251,8 @@ class DemoApp(Adw.Application):
 
         self.win.connect("close-request", self._on_close)
         self.win.present()
+        if self.args.minimized:
+            self.win.minimize()
 
         # backend asyncio in thread
         self.backend = Backend(self.args.port, self.bridge, self.store,
@@ -394,6 +396,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=11100)
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-m", "--minimized", action="store_true",
+                    help="avvia la finestra minimizzata")
     args = ap.parse_args()
 
     logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s",
