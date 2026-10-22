@@ -4,8 +4,7 @@
 Il fake veyon-service gira sempre in background su :11100; ogni
 StartDemoClient intercettato viene salvato in uno store persistente
 (~/.local/share/veyon-demo-viewer/demos.json) cosi' ogni demo resta
-accessibile con il suo token. La finestra mostra stato, demo catturate,
-log eventi; l'auto-apertura lancia demo_viewer.py ad ogni nuovo token.
+accessibile con il suo token. L'auto-apertura lancia demo_viewer.py.
 
 Uso: python3 veyondemo_gui.py [--port 11100] [-v]
 """
@@ -23,8 +22,8 @@ import time
 
 import gi
 gi.require_version("Gtk", "4.0")
-gi.require_version("Gdk", "4.0")
-from gi.repository import GLib, Gtk
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk
 
 import veyon_proto as vp
 from fake_service import ServiceCtx, run_service
@@ -76,10 +75,10 @@ class DemoStore:
         self.save()
         return rec
 
-    def deactivate(self, host=None):
+    def deactivate(self):
         changed = False
-        for k, rec in self.demos.items():
-            if rec.get("active") and (host is None or k.startswith(host)):
+        for rec in self.demos.values():
+            if rec.get("active"):
                 rec["active"] = False
                 changed = True
         if changed:
@@ -101,6 +100,7 @@ class Backend(threading.Thread):
         self.bridge = bridge            # queue.Queue -> GUI
         self.store = store
         self.verbose = verbose
+        self.ctx = None
 
     async def consume(self, events):
         while True:
@@ -143,7 +143,7 @@ class LogBridge(logging.Handler):
         super().__init__()
         self.bridge = bridge
         self.setFormatter(logging.Formatter(
-            "%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S"))
+            "%(asctime)s %(message)s", datefmt="%H:%M:%S"))
 
     def emit(self, record):
         try:
@@ -154,28 +154,7 @@ class LogBridge(logging.Handler):
 
 # ------------------------------------------------------------------ GUI
 
-class DemoRow(Gtk.ListBoxRow):
-    def __init__(self, rec, on_open):
-        super().__init__()
-        self.rec = rec
-        box = Gtk.Box(spacing=8)
-        box.set_margin_top(4)
-        box.set_margin_bottom(4)
-        title = f"{rec['host']}:{rec['port']}"
-        mode = "schermo intero" if rec["mode"] == "fullscreen" else "finestra"
-        ts = time.strftime("%H:%M:%S", time.localtime(rec["last"]))
-        state = "ATTIVA" if rec.get("active") else "terminata"
-        box.append(Gtk.Label(label=title, xalign=0))
-        box.append(Gtk.Label(
-            label=f"{mode} — token delle {ts} — {state}",
-            xalign=0, hexpand=True))
-        btn = Gtk.Button(label="Apri viewer")
-        btn.connect("clicked", lambda *_: on_open(rec))
-        box.append(btn)
-        self.set_child(box)
-
-
-class DemoApp(Gtk.Application):
+class DemoApp(Adw.Application):
     def __init__(self, args):
         super().__init__(application_id="dev.local.veyon-demo-gui")
         self.args = args
@@ -183,46 +162,92 @@ class DemoApp(Gtk.Application):
         self.store = DemoStore(STORE_PATH)
         self.viewer_proc = None
         self.rows = {}
+        self.backend = None
 
-    def do_startup(self):
-        Gtk.Application.do_startup(self)
+    # ---- costruzione UI ------------------------------------------------------
 
     def do_activate(self):
-        self.win = Gtk.ApplicationWindow(
-            application=self, title="Veyon Demo — servizio")
-        self.win.set_default_size(720, 520)
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        root.set_margin_top(10)
-        root.set_margin_bottom(10)
-        root.set_margin_start(10)
-        root.set_margin_end(10)
+        self.win = Adw.ApplicationWindow(
+            application=self, title="Veyon Demo")
+        self.win.set_default_size(640, 560)
 
-        self.status_lbl = Gtk.Label(
-            label=f"avvio servizio su :{self.args.port} …", xalign=0)
-        self.masters_lbl = Gtk.Label(label="master connessi: 0", xalign=0)
-        root.append(self.status_lbl)
-        root.append(self.masters_lbl)
+        header = Adw.HeaderBar()
+        self.status_dot = Gtk.Image(icon_name="media-record-symbolic")
+        self.status_dot.set_pixel_size(10)
+        header.pack_start(self.status_dot)
 
-        self.auto_sw = Gtk.CheckButton(
-            label="Apri automaticamente il viewer ad ogni nuova demo")
-        self.auto_sw.set_active(True)
-        root.append(self.auto_sw)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.append(header)
 
-        root.append(Gtk.Label(label="Presentazioni catturate:", xalign=0))
-        sw = Gtk.ScrolledWindow(vexpand=False, min_content_height=110)
-        self.listbox = Gtk.ListBox()
-        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-        sw.set_child(self.listbox)
-        root.append(sw)
+        clamp = Adw.Clamp(maximum_size=560)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        content.set_margin_top(18)
+        content.set_margin_bottom(18)
+        content.set_margin_start(18)
+        content.set_margin_end(18)
+        clamp.set_child(content)
+        outer.append(clamp)
+        self.win.set_content(outer)
 
-        root.append(Gtk.Label(label="Eventi:", xalign=0))
-        logsw = Gtk.ScrolledWindow(vexpand=True)
-        self.logview = Gtk.TextView(editable=False, monospace=True)
+        # -- gruppo stato --
+        grp = Adw.PreferencesGroup(title="Servizio")
+
+        self.svc_row = Adw.ActionRow(
+            title="Fake service",
+            subtitle=f"in ascolto sulla porta {self.args.port}")
+        self.svc_row.set_icon_name("network-server-symbolic")
+        self.svc_lbl = Gtk.Label(label="avvio…")
+        self.svc_lbl.add_css_class("dim-label")
+        self.svc_lbl.set_valign(Gtk.Align.CENTER)
+        self.svc_row.add_suffix(self.svc_lbl)
+        grp.add(self.svc_row)
+
+        self.masters_row = Adw.ActionRow(
+            title="Master connessi", subtitle="nessuno")
+        self.masters_row.set_icon_name("system-users-symbolic")
+        grp.add(self.masters_row)
+        content.append(grp)
+
+        # -- gruppo demo --
+        self.demo_grp = Adw.PreferencesGroup(title="Presentazioni")
+
+        self.auto_row = Adw.ActionRow(
+            title="Apertura automatica",
+            subtitle="apre il viewer a ogni nuova presentazione")
+        self.auto_row.set_icon_name("media-playback-start-symbolic")
+        self.auto_sw = Gtk.Switch(active=True, valign=Gtk.Align.CENTER)
+        self.auto_row.add_suffix(self.auto_sw)
+        self.auto_row.set_activatable_widget(self.auto_sw)
+        self.demo_grp.add(self.auto_row)
+
+        self.empty_row = Adw.ActionRow(
+            title="Nessuna presentazione intercettata",
+            subtitle="in attesa di StartDemoClient dal master")
+        self.empty_row.set_icon_name("video-display-symbolic")
+        self.empty_row.set_sensitive(False)
+        self.demo_grp.add(self.empty_row)
+
+        content.append(self.demo_grp)
+
+        # -- gruppo log --
+        self.log_grp = Adw.ExpanderRow(title="Registro eventi")
+        self.log_grp.set_icon_name("text-x-generic-symbolic")
+        self.log_grp.set_show_enable_switch(False)
+
+        scrolled = Gtk.ScrolledWindow(min_content_height=150,
+                                      max_content_height=220,
+                                      propagate_natural_height=True)
+        self.logview = Gtk.TextView(editable=False, monospace=True,
+                                    top_margin=6, bottom_margin=6,
+                                    left_margin=8, right_margin=8)
         self.logview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        logsw.set_child(self.logview)
-        root.append(logsw)
+        scrolled.set_child(self.logview)
+        frame = Gtk.Frame(child=scrolled)
+        frame.set_margin_top(4)
+        frame.set_margin_bottom(8)
+        self.log_grp.add_row(frame)
+        content.append(self.log_grp)
 
-        self.win.set_child(root)
         self.win.connect("close-request", self._on_close)
         self.win.present()
 
@@ -231,7 +256,6 @@ class DemoApp(Gtk.Application):
                                self.args.verbose)
         self.backend.start()
 
-        # log -> textview
         handler = LogBridge(self.bridge)
         handler.setLevel(logging.INFO if not self.args.verbose
                          else logging.DEBUG)
@@ -240,8 +264,8 @@ class DemoApp(Gtk.Application):
         GLib.timeout_add(150, self._poll_bridge)
         for rec in self.store.sorted():
             self.add_row(rec)
-        self.log_line("servizio avviato — in attesa del veyon-master "
-                      f"sulla porta {self.args.port}")
+        self.log_line(f"in ascolto su :{self.args.port} — "
+                      "attendo il veyon-master")
 
     # ---- helpers UI ---------------------------------------------------------
 
@@ -253,14 +277,35 @@ class DemoApp(Gtk.Application):
 
     def add_row(self, rec):
         key = DemoStore.key(rec["host"], rec["port"])
-        if key in self.rows:
-            self.listbox.remove(self.rows[key])
-        row = DemoRow(rec, self.open_viewer)
-        self.rows[key] = row
-        self.listbox.prepend(row)
+        old = self.rows.pop(key, None)
+        if old is not None:
+            self.demo_grp.remove(old)
+        self.empty_row.set_visible(False)
 
-    def refresh_row(self, rec):
-        self.add_row(rec)
+        mode = "schermo intero" if rec["mode"] == "fullscreen" else "finestra"
+        ts = time.strftime("%H:%M", time.localtime(rec["last"]))
+        active = rec.get("active")
+
+        row = Adw.ActionRow(title=f"{rec['host']}:{rec['port']}")
+        row.set_icon_name("video-display-symbolic")
+        row.set_subtitle(
+            f"{mode} · token delle {ts} · "
+            f"{'attiva' if active else 'terminata'}")
+
+        if active:
+            pill = Gtk.Label(label="LIVE")
+            pill.add_css_class("accent")
+            pill.add_css_class("caption-heading")
+            pill.set_valign(Gtk.Align.CENTER)
+            row.add_suffix(pill)
+
+        btn = Gtk.Button(label="Apri", valign=Gtk.Align.CENTER)
+        btn.add_css_class("suggested-action" if active else "flat")
+        btn.connect("clicked", lambda *_: self.open_viewer(rec))
+        row.add_suffix(btn)
+
+        self.demo_grp.add(row)
+        self.rows[key] = row
 
     def open_viewer(self, rec):
         self.kill_viewer()
@@ -275,9 +320,6 @@ class DemoApp(Gtk.Application):
             self.viewer_proc.terminate()
         self.viewer_proc = None
 
-    def update_status(self):
-        self._refresh_masters()
-
     # ---- bridge poll ---------------------------------------------------------
 
     def _poll_bridge(self):
@@ -291,7 +333,14 @@ class DemoApp(Gtk.Application):
 
     def _on_bridge(self, kind, payload):
         if kind == "log":
-            self.log_line(payload["line"])
+            line = payload["line"]
+            if " in ascolto su :" in line:
+                self.svc_lbl.set_text("attivo")
+                self.svc_lbl.remove_css_class("dim-label")
+                self.svc_lbl.add_css_class("success")
+                self.status_dot.add_css_class("success")
+            if "FeatureMessage" not in line or self.args.verbose:
+                self.log_line(line)
         elif kind == "conn":
             self.log_line(
                 f"master online: {payload['user'] or '?'} ({payload['ip']})")
@@ -301,7 +350,7 @@ class DemoApp(Gtk.Application):
             self._refresh_masters()
         elif kind == "demo":
             rec = payload
-            self.refresh_row(rec)
+            self.add_row(rec)
             self.log_line(
                 f"nuova demo su {rec['host']}:{rec['port']} "
                 f"({rec['mode']}) — token catturato")
@@ -310,20 +359,19 @@ class DemoApp(Gtk.Application):
         elif kind == "demo_stop":
             self.log_line("presentazione terminata — chiudo il viewer")
             self.kill_viewer()
-            for rec in self.store.demos.values():
-                if not rec.get("active"):
-                    self.refresh_row(rec)
+            for rec in self.store.sorted():
+                self.add_row(rec)
         elif kind == "fatal":
-            self.status_lbl.set_text(f"ERRORE servizio: {payload['error']}")
+            self.svc_lbl.set_text("errore")
+            self.svc_lbl.add_css_class("error")
             self.log_line(f"FATALE: {payload['error']}")
 
     def _refresh_masters(self):
-        # masters vive nel thread backend: accesso read-only tollerato
-        masters = getattr(self.backend, "ctx", None)
-        masters = masters.masters if masters else {}
+        ctx = self.backend.ctx if self.backend else None
+        masters = ctx.masters if ctx else {}
         txt = ("; ".join(f"{u or '?'} ({ip})" for ip, u in masters.items())
                if masters else "nessuno")
-        self.masters_lbl.set_text(f"master connessi: {txt}")
+        self.masters_row.set_subtitle(txt)
 
     def _on_close(self, *_):
         self.kill_viewer()
@@ -339,6 +387,7 @@ def main():
     logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s",
                         level=logging.DEBUG if args.verbose else logging.INFO)
 
+    Adw.init()
     app = DemoApp(args)
     app.run(sys.argv[:1])
 
