@@ -61,7 +61,8 @@ class DemoLauncher:
             await self.start_viewer(host, port, token)
         elif fm.command == vp.CMD_STOP_DEMO_CLIENT:
             log.info("demo stop")
-            self.say("presentazione terminata — chiudo il viewer")
+            if self.proc is not None:
+                self.say("presentazione terminata — chiudo il viewer")
             await self.stop_viewer()
 
     async def start_viewer(self, host, port, token):
