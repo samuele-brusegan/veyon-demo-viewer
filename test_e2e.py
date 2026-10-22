@@ -38,7 +38,7 @@ async def mock_demo_server(reader, writer):
     writer.write(bytes([1, vp.SEC_TYPE_VEYON]))
     await writer.drain()
     assert (await reader.readexactly(1))[0] == vp.SEC_TYPE_VEYON
-    writer.write(vp.pack_vam(1, vp.UserType("RfbVeyonAuth::Type", vp.AUTH_TOKEN)))
+    writer.write(vp.pack_vam(1, vp.AUTH_TOKEN))   # rete reale: plain Int
     await writer.drain()
     payload = await read_vam_r(reader)
     vals = vp.decode_all(payload)
@@ -104,8 +104,7 @@ async def mock_master(events):
     check("master: auth types offerti KeyFile+Logon",
           auth_types == [vp.AUTH_KEYFILE, vp.AUTH_LOGON])
 
-    writer.write(vp.pack_vam(vp.UserType("RfbVeyonAuth::Type", vp.AUTH_KEYFILE),
-                             "teacher"))
+    writer.write(vp.pack_vam(vp.AUTH_KEYFILE, "teacher"))   # plain Int
     await writer.drain()
     assert await reader.readexactly(4) == vp.EMPTY_VAM          # ack
     payload = await read_vam_r(reader)                        # challenge

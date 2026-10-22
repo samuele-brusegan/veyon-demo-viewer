@@ -83,11 +83,9 @@ class FakeServiceConnection:
         if sec[0] != vp.SEC_TYPE_VEYON:
             raise ValueError(f"security type rifiutato: {sec!r}")
 
-        # lista auth type offerti: KeyFile + Logon (il master sceglie);
-        # serializzati come enum RfbVeyonAuth::Type come fa il vero servizio
-        auth_enum = lambda t: vp.UserType("RfbVeyonAuth::Type", t)
-        await self.send(vp.pack_vam(2, auth_enum(vp.AUTH_KEYFILE),
-                                    auth_enum(vp.AUTH_LOGON)))
+        # lista auth type offerti: KeyFile + Logon (il master sceglie).
+        # Verificato su rete reale: il servizio li manda come plain Int.
+        await self.send(vp.pack_vam(2, vp.AUTH_KEYFILE, vp.AUTH_LOGON))
 
         payload = await read_vam(self.reader)
         vals = decode_vam(payload)
