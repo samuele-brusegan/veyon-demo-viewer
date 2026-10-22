@@ -95,6 +95,18 @@ class DemoRfbClient(threading.Thread):
 
     # -- decode rects --------------------------------------------------------
 
+    def blit(self, x, y, w, h, data):
+        n = w * h
+        per_px = len(data) // n
+        if per_px == 3:          # 24bpp R,G,B come richiesto
+            self.fb[y:y + h, x:x + w] = \
+                np.frombuffer(data, np.uint8).reshape(h, w, 3)
+        elif per_px == 4:        # 32bpp nativo del backend (BGRX little-endian)
+            self.fb[y:y + h, x:x + w] = \
+                np.frombuffer(data, np.uint8).reshape(h, w, 4)[:, :, [2, 1, 0]]
+        else:
+            raise RuntimeError(f"pixel data inattesa: {len(data)}B per {w}x{h}")
+
     def read_rects(self, n):
         s = self.sock
         w, h = self.fb_size
@@ -105,13 +117,11 @@ class DemoRfbClient(threading.Thread):
                 return
             if enc == vp.ENC_RAW:
                 data = recv_exactly(s, rw * rh * 3)
-                self.fb[y:y + rh, x:x + rw] = \
-                    np.frombuffer(data, np.uint8).reshape(rh, rw, 3)
+                self.blit(x, y, rw, rh, data)
             elif enc == vp.ENC_ZLIB:
                 (ln,) = struct.unpack(">I", recv_exactly(s, 4))
                 data = zlib.decompress(recv_exactly(s, ln))
-                self.fb[y:y + rh, x:x + rw] = \
-                    np.frombuffer(data, np.uint8).reshape(rh, rw, 3)
+                self.blit(x, y, rw, rh, data)
             elif enc == vp.ENC_COPYRECT:
                 sx, sy = struct.unpack(">HH", recv_exactly(s, 4))
                 self.fb[y:y + rh, x:x + rw] = self.fb[sy:sy + rh, sx:sx + rw]
@@ -163,14 +173,20 @@ class DemoRfbClient(threading.Thread):
 
     def run(self):
         import time
+        attempt = 0
         while not self.app.closed:
             try:
+                attempt += 1
+                print(f"[{attempt}] connect {self.host}:{self.port}", file=sys.stderr, flush=True)
                 self.sock = socket.create_connection((self.host, self.port), 10)
                 self.sock.settimeout(None)
+                print("  handshake...", file=sys.stderr, flush=True)
                 self.handshake()
+                print("  auth OK, streaming", file=sys.stderr, flush=True)
                 GLib.idle_add(self.app.set_status, "connesso")
                 self.serve()
             except Exception as e:
+                print(f"  errore: {e!r}", file=sys.stderr, flush=True)
                 GLib.idle_add(self.app.set_status, f"disconnesso: {e} — riprovo")
             finally:
                 if self.sock:
