@@ -6,6 +6,8 @@ una finestra GTK4 (minimizzabile, mai fullscreen).
 Uso: python3 demo_viewer.py <host> <porta> <token_hex>
 """
 
+import os
+import shutil
 import socket
 import struct
 import sys
@@ -22,6 +24,18 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
 import veyon_proto as vp
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def install_icon():
+    dst = os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps")
+    try:
+        os.makedirs(dst, exist_ok=True)
+        shutil.copyfile(os.path.join(HERE, "assets", "icon.svg"),
+                        os.path.join(dst, "veyon-demo-viewer.svg"))
+    except OSError:
+        pass
 
 
 def recv_exactly(sock, n):
@@ -389,6 +403,7 @@ class DemoApp(Gtk.Application):
 
     def do_activate(self):
         self.win = Gtk.ApplicationWindow(application=self, title="Veyon Demo")
+        self.win.set_icon_name("veyon-demo-viewer")
         self.win.set_default_size(960, 600)
         self.win.connect("close-request", self._on_close)
         self.picture = Gtk.Picture()
@@ -421,6 +436,7 @@ def main():
     host, port, token_hex = sys.argv[1], int(sys.argv[2]), sys.argv[3]
     token = bytes.fromhex(token_hex)
 
+    install_icon()
     app = DemoApp()
     client = DemoRfbClient(host, port, token, app)
     client.start()

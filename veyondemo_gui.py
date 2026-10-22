@@ -169,6 +169,7 @@ class DemoApp(Adw.Application):
     def do_activate(self):
         self.win = Adw.ApplicationWindow(
             application=self, title="Veyon Demo")
+        self.win.set_icon_name("veyon-demo-viewer")
         self.win.set_default_size(640, 560)
 
         header = Adw.HeaderBar()
@@ -378,6 +379,17 @@ class DemoApp(Adw.Application):
         return False
 
 
+def _install_icon():
+    dst = os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps")
+    try:
+        os.makedirs(dst, exist_ok=True)
+        import shutil
+        shutil.copyfile(os.path.join(HERE, "assets", "icon.svg"),
+                        os.path.join(dst, "veyon-demo-viewer.svg"))
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=11100)
@@ -388,6 +400,7 @@ def main():
                         level=logging.DEBUG if args.verbose else logging.INFO)
 
     Adw.init()
+    _install_icon()
     app = DemoApp(args)
     app.run(sys.argv[:1])
 

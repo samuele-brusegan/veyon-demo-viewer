@@ -1,4 +1,4 @@
-# veyon-demo-viewer
+# veyon-demo-viewer <img src="assets/icon.svg" width="48" align="right">
 
 Watch [Veyon](https://veyon.io) classroom demos (screen presentations) on a
 Linux machine that **is not** an official Veyon client — without exposing your
