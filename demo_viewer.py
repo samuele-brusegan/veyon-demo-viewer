@@ -128,45 +128,52 @@ class DemoRfbClient(threading.Thread):
 
     # -- main loop -----------------------------------------------------------
 
+    def serve(self):
+        s = self.sock
+        while True:
+            mtype = recv_exactly(s, 1)[0]
+            if mtype == vp.MSG_FB_UPDATE:
+                (n,) = struct.unpack(">xH", recv_exactly(s, 3))
+                self.read_rects(n)
+                GLib.idle_add(self.app.refresh, self.fb)
+                self.request_update(True)
+            elif mtype == vp.MSG_SET_COLOURMAP:
+                hdr = recv_exactly(s, 5)
+                (nc,) = struct.unpack(">xHH", hdr)
+                recv_exactly(s, nc * 6)
+            elif mtype == vp.MSG_BELL:
+                pass
+            elif mtype == vp.MSG_SERVER_CUT_TEXT:
+                hdr = recv_exactly(s, 7)
+                (ln,) = struct.unpack(">I", hdr[3:7])
+                recv_exactly(s, ln)
+            elif mtype == vp.MSG_RESIZE_FB:
+                w, h = struct.unpack(">HH", recv_exactly(s, 4))
+                self.resize_fb(w, h)
+            elif mtype == vp.MSG_FEATURE:
+                recv_vam(s)
+            else:
+                raise RuntimeError(f"msg type sconosciuto {mtype}")
+
     def run(self):
-        try:
-            self.sock = socket.create_connection((self.host, self.port), 10)
-            self.sock.settimeout(None)
-            self.handshake()
-            GLib.idle_add(self.app.set_status, "connesso")
-            while True:
-                mtype = recv_exactly(self.sock, 1)[0]
-                if mtype == vp.MSG_FB_UPDATE:
-                    (n,) = struct.unpack(">xH", recv_exactly(self.sock, 3))
-                    self.read_rects(n)
-                    GLib.idle_add(self.app.refresh, self.fb)
-                    self.request_update(True)
-                elif mtype == vp.MSG_SET_COLOURMAP:
-                    hdr = recv_exactly(self.sock, 5)
-                    (nc,) = struct.unpack(">xHH", hdr)
-                    recv_exactly(self.sock, nc * 6)
-                elif mtype == vp.MSG_BELL:
-                    pass
-                elif mtype == vp.MSG_SERVER_CUT_TEXT:
-                    hdr = recv_exactly(self.sock, 7)
-                    (ln,) = struct.unpack(">I", hdr[3:7])
-                    recv_exactly(self.sock, ln)
-                elif mtype == vp.MSG_RESIZE_FB:
-                    w, h = struct.unpack(">HH", recv_exactly(self.sock, 4))
-                    self.resize_fb(w, h)
-                elif mtype == vp.MSG_FEATURE:
-                    recv_vam(self.sock)
-                else:
-                    print(f"msg type sconosciuto {mtype}, uscita", file=sys.stderr)
-                    break
-        except Exception as e:
-            GLib.idle_add(self.app.set_status, f"disconnesso: {e}")
-        finally:
-            if self.sock:
-                try:
-                    self.sock.close()
-                except Exception:
-                    pass
+        import time
+        while not self.app.closed:
+            try:
+                self.sock = socket.create_connection((self.host, self.port), 10)
+                self.sock.settimeout(None)
+                self.handshake()
+                GLib.idle_add(self.app.set_status, "connesso")
+                self.serve()
+            except Exception as e:
+                GLib.idle_add(self.app.set_status, f"disconnesso: {e} — riprovo")
+            finally:
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+            time.sleep(2)
 
 
 class DemoApp(Gtk.Application):
@@ -174,14 +181,20 @@ class DemoApp(Gtk.Application):
         super().__init__(application_id="dev.local.veyon-demo-viewer")
         self.picture = None
         self.win = None
+        self.closed = False
 
     def do_activate(self):
         self.win = Gtk.ApplicationWindow(application=self, title="Veyon Demo")
         self.win.set_default_size(960, 600)
+        self.win.connect("close-request", self._on_close)
         self.picture = Gtk.Picture()
         self.picture.set_can_shrink(True)
         self.win.set_child(self.picture)
         self.win.present()
+
+    def _on_close(self, *_):
+        self.closed = True
+        return False
 
     def set_size(self, w, h):
         self.win.set_default_size(min(w, 1600), min(h, 1000))
