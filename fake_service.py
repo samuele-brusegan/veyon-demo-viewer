@@ -63,7 +63,10 @@ class FakeServiceConnection:
 
     async def send(self, data):
         self.writer.write(data)
-        await self.writer.drain()
+        try:
+            await self.writer.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            raise ConnectionResetError("peer chiuso durante send")
 
     def log_rx(self, name, data):
         if self.ctx.verbose:
