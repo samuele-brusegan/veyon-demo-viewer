@@ -10,6 +10,7 @@ import socket
 import struct
 import sys
 import threading
+import zlib
 
 import numpy as np
 
@@ -104,6 +105,11 @@ class DemoRfbClient(threading.Thread):
                 return
             if enc == vp.ENC_RAW:
                 data = recv_exactly(s, rw * rh * 3)
+                self.fb[y:y + rh, x:x + rw] = \
+                    np.frombuffer(data, np.uint8).reshape(rh, rw, 3)
+            elif enc == vp.ENC_ZLIB:
+                (ln,) = struct.unpack(">I", recv_exactly(s, 4))
+                data = zlib.decompress(recv_exactly(s, ln))
                 self.fb[y:y + rh, x:x + rw] = \
                     np.frombuffer(data, np.uint8).reshape(rh, rw, 3)
             elif enc == vp.ENC_COPYRECT:

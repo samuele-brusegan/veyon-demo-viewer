@@ -45,6 +45,7 @@ AUTH_TOKEN = 5
 # encodings
 ENC_RAW = 0
 ENC_COPYRECT = 1
+ENC_ZLIB = 7
 ENC_LAST_RECT = 0xFFFFFFE0
 
 # feature uids demo (plugins/demo/DemoFeaturePlugin.cpp)
