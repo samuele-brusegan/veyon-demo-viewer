@@ -88,8 +88,8 @@ Stesso handshake Veyon; `supportedAuthTypes = [Token=5]`:
 Il demo server chiede al backend, in ordine: Tight(7), ZYWRLE(17),
 ZRLE(16), Ultra(9), CopyRect(1), Hextile(5), CoRRE(4), RRE(2), Raw(0) +
 CompressLevel9, QualityLevel(q), NewFBSize(0xffffff21), LastRect
-(0xffffffe0). Backend tipici (UltraVNC/x11vnc) scelgono **Tight**, spesso
-con JPEG per il desktop (quality adjust adattivo in base alla banda).
+(0xffffff20 — 0xffffffe0..e9 sono i livelli qualita' JPEG, non LastRect).
+Backend tipici (UltraVNC/x11vnc) scelgono **Tight**, spesso con JPEG.
 
 ### Tight (encoding 7) — decode implementato
 
@@ -107,6 +107,15 @@ altrimenti 8 bit/px. Gradient: predizione `prevRow + left - prevLeft`
 clampata 0-255 su 3B/px. Dati < `rh*rowSize` < 12B viaggiano in chiaro
 senza lunghezza; altrimenti compact-len (varint 7bit, 1-3B) + zlib/raw.
 TPIXEL: con 32bpp/depth24 i pixel sono 3B RGB ("cutZeros").
+
+Nota mid-stream join: l'encoder Tight non resetta mai gli stream zlib
+(comp_ctl ha sempre nibble basso 0, zsActive azzerato solo alla nascita
+della connessione col backend). Chi si unisce a meta' riceve chunk di
+continuazione senza history → non decodificabili: il viewer li consuma
+e li salta marcando lo stream "bad". Si recupera solo dopo un
+`reconnectToVncServer` (epoca nuova = stream freschi con header zlib):
+per questo il viewer, se ha stream avvelenati, si riconnette ogni ~20s —
+un FBUR con seq 0 contro fbuSeq>0 innesca il resync globale.
 
 ### synchronizationLost / restart globale
 

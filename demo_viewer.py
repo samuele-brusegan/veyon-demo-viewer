@@ -10,6 +10,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import zlib
 
 import numpy as np
@@ -61,6 +62,9 @@ class DemoRfbClient(threading.Thread):
         self.sock = None
         self.fb = None              # numpy (h, w, 3) RGB
         self.fb_size = (0, 0)
+        self.tight_bad = [False] * 4
+        self.t_conn = 0.0
+        self._refresh_pending = False
 
     # -- handshake -----------------------------------------------------------
 
@@ -232,6 +236,8 @@ class DemoRfbClient(threading.Thread):
                     print(f"  tight: stream {sid} senza history "
                           f"(join a meta' stream), rect {x},{y} {w}x{h} saltato",
                           file=sys.stderr, flush=True)
+                    GLib.idle_add(self.app.set_status,
+                                  "connesso (stream parziale, attendo resync)")
                     return
         if len(data) < size:
             raise RuntimeError(f"tight: dati corti {len(data)}/{size}B")
@@ -299,8 +305,15 @@ class DemoRfbClient(threading.Thread):
                 (n,) = struct.unpack(">xH", recv_exactly(s, 3))
                 self.read_rects(n)
                 self.frames += 1
-                GLib.idle_add(self.app.refresh, self.fb)
+                self.mark_dirty()
                 self.request_update(True)
+                # stream zlib avvelenati non guariscono da soli (l'encoder non
+                # resetta mai): riconnettersi periodicamente da' la chance di
+                # beccare fbuSeq>0 -> resync globale -> epoca con stream puliti
+                if any(self.tight_bad) and \
+                        time.monotonic() - self.t_conn > 20:
+                    raise RuntimeError(
+                        "stream zlib senza history: riprovo per resync")
             elif mtype == vp.MSG_SET_COLOURMAP:
                 hdr = recv_exactly(s, 5)
                 (nc,) = struct.unpack(">xHH", hdr)
@@ -319,8 +332,16 @@ class DemoRfbClient(threading.Thread):
             else:
                 raise RuntimeError(f"msg type sconosciuto {mtype}")
 
+    def mark_dirty(self):
+        if not self._refresh_pending:
+            self._refresh_pending = True
+            GLib.idle_add(self._refresh_now)
+
+    def _refresh_now(self):
+        self._refresh_pending = False
+        self.app.refresh(self.fb)
+
     def run(self):
-        import time
         attempt = 0
         while not self.app.closed:
             try:
@@ -331,6 +352,7 @@ class DemoRfbClient(threading.Thread):
                 print("  handshake...", file=sys.stderr, flush=True)
                 self.handshake()
                 self.frames = 0
+                self.t_conn = time.monotonic()
                 print("  auth OK, streaming", file=sys.stderr, flush=True)
                 GLib.idle_add(self.app.set_status, "connesso")
                 self.serve()
