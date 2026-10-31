@@ -31,6 +31,7 @@ from fake_service import ServiceCtx, run_service
 log = logging.getLogger("veyondemo_gui")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+APP_ID = "dev.local.veyon-demo-gui"
 STORE_PATH = os.path.expanduser(
     "~/.local/share/veyon-demo-viewer/demos.json")
 
@@ -156,11 +157,12 @@ class LogBridge(logging.Handler):
 
 class DemoApp(Adw.Application):
     def __init__(self, args):
-        super().__init__(application_id="dev.local.veyon-demo-gui")
+        super().__init__(application_id=APP_ID)
         self.args = args
         self.bridge = queue.Queue()
         self.store = DemoStore(STORE_PATH)
         self.viewer_proc = None
+        self.viewer_key = None
         self.rows = {}
         self.backend = None
 
@@ -168,8 +170,8 @@ class DemoApp(Adw.Application):
 
     def do_activate(self):
         self.win = Adw.ApplicationWindow(
-            application=self, title="Veyon Demo")
-        self.win.set_icon_name("veyon-demo-viewer")
+            application=self, title="Veyon (admin)")
+        self.win.set_icon_name("veyon-demo-admin")
         self.win.set_default_size(640, 560)
 
         header = Adw.HeaderBar()
@@ -311,16 +313,28 @@ class DemoApp(Adw.Application):
         self.rows[key] = row
 
     def open_viewer(self, rec):
+        key = (rec["host"], int(rec["port"]), rec["token"])
+        if self.viewer_key == key and self.viewer_proc is not None \
+                and self.viewer_proc.poll() is None:
+            self.log_line(f"viewer già aperto su {rec['host']}:{rec['port']} — "
+                          "ignoro il riavvio")
+            return
         self.kill_viewer()
         self.log_line(f"apertura viewer su {rec['host']}:{rec['port']}…")
         self.viewer_proc = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "demo_viewer.py"),
              rec["host"], str(rec["port"]), rec["token"]],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.viewer_key = key
 
     def kill_viewer(self):
+        self.viewer_key = None
         if self.viewer_proc and self.viewer_proc.poll() is None:
             self.viewer_proc.terminate()
+            try:
+                self.viewer_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.viewer_proc.kill()
         self.viewer_proc = None
 
     # ---- bridge poll ---------------------------------------------------------
@@ -382,12 +396,43 @@ class DemoApp(Adw.Application):
 
 
 def _install_icon():
-    dst = os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps")
+    theme = os.path.expanduser("~/.local/share/icons/hicolor")
+    dst = os.path.join(theme, "scalable/apps")
     try:
         os.makedirs(dst, exist_ok=True)
         import shutil
         shutil.copyfile(os.path.join(HERE, "assets", "icon.svg"),
                         os.path.join(dst, "veyon-demo-viewer.svg"))
+        shutil.copyfile(os.path.join(HERE, "assets", "icon-admin.svg"),
+                        os.path.join(dst, "veyon-demo-admin.svg"))
+    except OSError:
+        pass
+    cache = os.path.join(theme, "icon-theme.cache")
+    if os.path.exists(cache) and not os.access(cache, os.W_OK):
+        try:
+            os.remove(cache)
+        except OSError:
+            pass
+    import shutil
+    if shutil.which("gtk-update-icon-cache"):
+        subprocess.run(["gtk-update-icon-cache", "-f", "-t", "-q", theme],
+                       check=False)
+
+
+def _install_desktop_entry():
+    apps = os.path.expanduser("~/.local/share/applications")
+    try:
+        os.makedirs(apps, exist_ok=True)
+        with open(os.path.join(apps, APP_ID + ".desktop"), "w") as f:
+            f.write("[Desktop Entry]\n"
+                    "Type=Application\n"
+                    "Name=Veyon (admin)\n"
+                    "Comment=Cattura e mostra le presentazioni Veyon\n"
+                    "Icon=veyon-demo-admin\n"
+                    f"Exec={sys.executable} "
+                    f"{os.path.join(HERE, 'veyondemo_gui.py')}\n"
+                    "Terminal=false\n"
+                    "Categories=Network;RemoteAccess;\n")
     except OSError:
         pass
 
@@ -405,6 +450,8 @@ def main():
 
     Adw.init()
     _install_icon()
+    _install_desktop_entry()
+    GLib.set_application_name("Veyon (admin)")
     app = DemoApp(args)
     app.run(sys.argv[:1])
 

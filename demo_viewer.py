@@ -10,6 +10,7 @@ import os
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -26,14 +27,44 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 import veyon_proto as vp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+APP_ID = "dev.local.veyon-demo-viewer"
 
 
 def install_icon():
-    dst = os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps")
+    theme = os.path.expanduser("~/.local/share/icons/hicolor")
+    dst = os.path.join(theme, "scalable/apps")
     try:
         os.makedirs(dst, exist_ok=True)
         shutil.copyfile(os.path.join(HERE, "assets", "icon.svg"),
                         os.path.join(dst, "veyon-demo-viewer.svg"))
+    except OSError:
+        pass
+    cache = os.path.join(theme, "icon-theme.cache")
+    if os.path.exists(cache) and not os.access(cache, os.W_OK):
+        try:
+            os.remove(cache)         # stantia e non aggiornabile: via
+        except OSError:
+            pass
+    if shutil.which("gtk-update-icon-cache"):
+        subprocess.run(["gtk-update-icon-cache", "-f", "-t", "-q", theme],
+                       check=False)
+
+
+def install_desktop_entry():
+    """~/.local/share/applications/<app_id>.desktop: senza questo GNOME
+    non associa la finestra a un'app (icona/nome di fallback in Alt-Tab)."""
+    apps = os.path.expanduser("~/.local/share/applications")
+    try:
+        os.makedirs(apps, exist_ok=True)
+        with open(os.path.join(apps, APP_ID + ".desktop"), "w") as f:
+            f.write("[Desktop Entry]\n"
+                    "Type=Application\n"
+                    "Name=Veyon (demo)\n"
+                    "Icon=veyon-demo-viewer\n"
+                    f"Exec={sys.executable} "
+                    f"{os.path.join(HERE, 'demo_viewer.py')}\n"
+                    "Terminal=false\n"
+                    "NoDisplay=true\n")
     except OSError:
         pass
 
@@ -396,13 +427,18 @@ class DemoRfbClient(threading.Thread):
 
 class DemoApp(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="dev.local.veyon-demo-viewer")
+        super().__init__(application_id=APP_ID)
         self.picture = None
         self.win = None
         self.closed = False
+        self._size_set = False
 
     def do_activate(self):
-        self.win = Gtk.ApplicationWindow(application=self, title="Veyon Demo")
+        if self.win is not None:
+            self.win.present()
+            return
+        self.win = Gtk.ApplicationWindow(application=self,
+                                         title="Veyon (demo)")
         self.win.set_icon_name("veyon-demo-viewer")
         self.win.set_default_size(960, 600)
         self.win.connect("close-request", self._on_close)
@@ -416,10 +452,13 @@ class DemoApp(Gtk.Application):
         return False
 
     def set_size(self, w, h):
+        if self._size_set:
+            return
+        self._size_set = True
         self.win.set_default_size(min(w, 1600), min(h, 1000))
 
     def set_status(self, text):
-        self.win.set_title(f"Veyon Demo — {text}")
+        self.win.set_title(f"Veyon (demo) — {text}")
 
     def refresh(self, fb):
         h, w, _ = fb.shape
@@ -437,6 +476,8 @@ def main():
     token = bytes.fromhex(token_hex)
 
     install_icon()
+    install_desktop_entry()
+    GLib.set_application_name("Veyon (demo)")
     app = DemoApp()
     client = DemoRfbClient(host, port, token, app)
     client.start()

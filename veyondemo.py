@@ -30,6 +30,7 @@ class DemoLauncher:
         self.spawn = spawn
         self.human = human
         self.proc = None
+        self.proc_key = None
 
     def say(self, msg):
         if self.human:
@@ -66,6 +67,13 @@ class DemoLauncher:
             await self.stop_viewer()
 
     async def start_viewer(self, host, port, token):
+        key = (host, int(port), token.hex())
+        if self.proc is not None and self.proc.returncode is None \
+                and self.proc_key == key:
+            log.info("StartDemoClient duplicato: viewer gia' attivo")
+            self.say("stessa presentazione ri-annunciata dal master — "
+                     "la finestra resta dov'è")
+            return
         await self.stop_viewer()
         if not self.spawn:
             log.info("viewer disabilitato (--no-viewer)")
@@ -75,8 +83,10 @@ class DemoLauncher:
             host, str(port), token.hex(),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL)
+        self.proc_key = key
 
     async def stop_viewer(self):
+        self.proc_key = None
         if self.proc is None:
             return
         if self.proc.returncode is None:
@@ -85,6 +95,7 @@ class DemoLauncher:
                 await asyncio.wait_for(self.proc.wait(), 3)
             except asyncio.TimeoutError:
                 self.proc.kill()
+                await self.proc.wait()
         self.proc = None
 
 
