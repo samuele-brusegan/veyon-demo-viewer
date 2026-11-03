@@ -26,13 +26,18 @@ This project implements two parts:
   (typically `host:11400`), authenticates with the intercepted token, decodes
   the broadcast RFB stream (Tight encoding: fill, JPEG, copy/palette/gradient
   filters, persistent zlib streams; plus raw/copyrect and UltraVNC
-  pseudo-encodings) and renders it in a GTK4 window. Resilient to demo-server
+  pseudo-encodings) and renders it in a minimal, borderless, PiP-style GTK4
+  window: drag it anywhere, `Esc`/`q` closes it. Resilient to demo-server
   resyncs and mid-stream joins; auto-reconnects.
+- **daemon** (`veyon_daemon.py`) — a minimal background service: the fake
+  service without GUI and without viewer. It captures `StartDemoClient`
+  tokens and persists them to
+  `~/.local/share/veyon-demo-viewer/demos.json`, so presentations caught
+  while the GUI was closed are already there on first launch.
 
 `veyondemo.py` ties them together on the command line; `veyondemo_gui.py`
 provides an Adwaita control window that keeps the service running in the
-background, stores every captured token persistently
-(`~/.local/share/veyon-demo-viewer/demos.json`), lists intercepted
+background, shares the same token store, lists intercepted
 presentations and auto-opens the viewer on each new demo.
 
 ## Requirements
@@ -51,6 +56,12 @@ python3 veyondemo_gui.py
 
 Keep it open or minimized — it captures every `StartDemoClient` and opens the
 viewer automatically.
+
+Minimal background service (captures tokens even while the GUI is closed):
+
+```bash
+python3 veyon_daemon.py         # add & or run under your autostart/systemd
+```
 
 Command line:
 

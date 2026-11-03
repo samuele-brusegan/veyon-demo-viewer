@@ -11,7 +11,6 @@ Uso: python3 veyondemo_gui.py [--port 11100] [-v]
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import queue
@@ -27,67 +26,12 @@ from gi.repository import Adw, GLib, Gtk
 
 import veyon_proto as vp
 from fake_service import ServiceCtx, run_service
+from demo_store import DemoStore, STORE_PATH
 
 log = logging.getLogger("veyondemo_gui")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_ID = "dev.local.veyon-demo-gui"
-STORE_PATH = os.path.expanduser(
-    "~/.local/share/veyon-demo-viewer/demos.json")
-
-
-# ------------------------------------------------------------------ store
-
-class DemoStore:
-    """Token demo catturati, persistenti su disco (chiave host:port)."""
-
-    def __init__(self, path):
-        self.path = path
-        self.demos = {}
-        self.load()
-
-    def load(self):
-        try:
-            with open(self.path) as f:
-                self.demos = json.load(f)
-        except Exception:
-            self.demos = {}
-
-    def save(self):
-        try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.demos, f, indent=1)
-            os.replace(tmp, self.path)
-        except OSError as e:
-            log.warning("store: salvataggio fallito: %s", e)
-
-    @staticmethod
-    def key(host, port):
-        return f"{host}:{port}"
-
-    def upsert(self, host, port, token, mode):
-        rec = self.demos.get(self.key(host, port), {})
-        rec.update(host=host, port=port, token=token.hex(), mode=mode,
-                   first=rec.get("first", time.time()),
-                   last=time.time(), active=True)
-        self.demos[self.key(host, port)] = rec
-        self.save()
-        return rec
-
-    def deactivate(self):
-        changed = False
-        for rec in self.demos.values():
-            if rec.get("active"):
-                rec["active"] = False
-                changed = True
-        if changed:
-            self.save()
-
-    def sorted(self):
-        return sorted(self.demos.values(),
-                      key=lambda r: r.get("last", 0), reverse=True)
 
 
 # ------------------------------------------------------------------ backend
@@ -382,6 +326,10 @@ class DemoApp(Adw.Application):
             self.svc_lbl.set_text("errore")
             self.svc_lbl.add_css_class("error")
             self.log_line(f"FATALE: {payload['error']}")
+            if "98" in payload["error"]:
+                self.svc_row.set_subtitle(
+                    "porta occupata — il daemon veyon_daemon.py "
+                    "o un'altra istanza è già attivo")
 
     def _refresh_masters(self):
         ctx = self.backend.ctx if self.backend else None

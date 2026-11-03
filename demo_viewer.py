@@ -1,7 +1,8 @@
 """demo_viewer.py - viewer per il demo server Veyon.
 
 Si connette a host:porta con auth a token e mostra lo schermo condiviso in
-una finestra GTK4 (minimizzabile, mai fullscreen).
+una finestrella GTK4 stile PiP: senza decorazioni, trascinabile con il
+mouse, chiusura con Esc/q (o Alt-F4 / taskbar).
 
 Uso: python3 demo_viewer.py <host> <porta> <token_hex>
 """
@@ -440,12 +441,34 @@ class DemoApp(Gtk.Application):
         self.win = Gtk.ApplicationWindow(application=self,
                                          title="Veyon (demo)")
         self.win.set_icon_name("veyon-demo-viewer")
-        self.win.set_default_size(960, 600)
+        self.win.set_decorated(False)          # stile PiP
+        self.win.set_default_size(640, 360)
         self.win.connect("close-request", self._on_close)
         self.picture = Gtk.Picture()
         self.picture.set_can_shrink(True)
         self.win.set_child(self.picture)
+
+        drag = Gtk.GestureDrag()               # trascina per spostare
+        drag.connect("drag-begin", self._on_drag_begin)
+        self.win.add_controller(drag)
+        keys = Gtk.EventControllerKey()        # Esc/q per chiudere
+        keys.connect("key-pressed", self._on_key)
+        self.win.add_controller(keys)
+
         self.win.present()
+
+    def _on_drag_begin(self, gesture, x, y):
+        surface = self.win.get_surface()
+        if surface is not None:
+            surface.begin_move(gesture.get_device(),
+                               gesture.get_current_button(),
+                               x, y, gesture.get_current_event_time())
+
+    def _on_key(self, _ctl, keyval, _code, _state):
+        if keyval in (Gdk.KEY_Escape, Gdk.KEY_q):
+            self.win.close()
+            return True
+        return False
 
     def _on_close(self, *_):
         self.closed = True
@@ -455,7 +478,7 @@ class DemoApp(Gtk.Application):
         if self._size_set:
             return
         self._size_set = True
-        self.win.set_default_size(min(w, 1600), min(h, 1000))
+        self.win.set_default_size(min(w, 640), min(h, 400))
 
     def set_status(self, text):
         self.win.set_title(f"Veyon (demo) — {text}")
