@@ -68,6 +68,17 @@ DEMO_UID_FULLSCREEN = uuidlib.UUID("7b6231bd-eb89-45d3-af32-f70663b2f878")
 DEMO_UID_WINDOW = uuidlib.UUID("ae45c3db-dc2e-4204-ae8b-374cdab8c62c")
 DEMO_UIDS = (DEMO_UID_FULLSCREEN, DEMO_UID_WINDOW)
 
+# feature builtin/plugin UIDs (sorgente veyon)
+UID_SCREEN_LOCK = uuidlib.UUID("ccb535a2-1d24-4cc1-a709-8b47d2b2ac79")
+UID_INPUT_LOCK = uuidlib.UUID("e4a77879-e544-4fec-bc18-e534f33b934c")
+UID_TEXT_MESSAGE = uuidlib.UUID("e75ae9c8-ac17-4d00-8f0d-019348346208")
+UID_POWER_REBOOT = uuidlib.UUID("4f7d98f0-395a-4fff-b968-e49b8d0f748c")
+UID_POWER_DOWN = uuidlib.UUID("6f5a27a0-0e2f-496e-afcc-7aae62eede10")
+CMD_ACTION = 0
+CMD_LOCK_STOP = 1
+ARG_TEXT = "0"
+ARG_ICON = "1"
+
 # feature builtin (core/src/MonitoringMode.cpp)
 UID_MONITORING = uuidlib.UUID("edad8259-b4ef-4ca5-90e6-f238d0fda694")   # Ping=0
 UID_QUERY_APP_VERSION = uuidlib.UUID("58f5d5d5-9929-48f4-a995-f221c150ae26")
@@ -372,3 +383,20 @@ def build_fb_update_raw(x, y, w, h, bpp_bytes):
 
 def build_empty_fb_update():
     return struct.pack(">BxH", MSG_FB_UPDATE, 0)
+
+
+def build_fb_update_rgb(fb, w, h):
+    """FBU raw 32bpp con frame np (oh,ow,3) RGB scalato letterbox in (w,h).
+    Il pixel format annunciato e' BGRX little-endian."""
+    import numpy as np
+    oh, ow = fb.shape[:2]
+    s = min(w / ow, h / oh)
+    nw, nh = max(1, int(ow * s)), max(1, int(oh * s))
+    iy = np.linspace(0, oh - 1, nh).astype(int)
+    ix = np.linspace(0, ow - 1, nw).astype(int)
+    scaled = fb[np.ix_(iy, ix)]
+    canvas = np.zeros((h, w, 4), np.uint8)
+    y0, x0 = (h - nh) // 2, (w - nw) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw, :3] = scaled[:, :, ::-1]   # RGB->BGR
+    rect_hdr = struct.pack(">HHHHi", 0, 0, w, h, ENC_RAW)
+    return struct.pack(">BxH", MSG_FB_UPDATE, 1) + rect_hdr + canvas.tobytes()

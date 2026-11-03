@@ -4,15 +4,48 @@ Condiviso tra veyondemo_gui.py (che lo mostra) e veyon_daemon.py
 (che lo popola in background anche a GUI spenta).
 """
 
+import ipaddress
 import json
 import logging
 import os
+import socket
 import time
 
 log = logging.getLogger("demo_store")
 
 STORE_PATH = os.path.expanduser(
     "~/.local/share/veyon-demo-viewer/demos.json")
+
+
+def ip_net24(ip):
+    """Rete /24 di un IPv4 (es. '192.168.4.17' -> '192.168.4.0/24').
+    None se non e' un IPv4."""
+    try:
+        addr = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return None
+    if addr.version != 4:
+        return None
+    return str(ipaddress.ip_network(f"{addr}/24", strict=False))
+
+
+def local_ipv4():
+    """IPv4 locale corrente (interfaccia della rotta di default)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 80))
+            return s.getsockname()[0]
+    except OSError:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return None
+
+
+def local_net24():
+    """Rete /24 locale corrente. None se non determinabile."""
+    return ip_net24(local_ipv4())
 
 
 class DemoStore:
@@ -44,9 +77,10 @@ class DemoStore:
     def key(host, port):
         return f"{host}:{port}"
 
-    def upsert(self, host, port, token, mode):
+    def upsert(self, host, port, token, mode, net=None):
         rec = self.demos.get(self.key(host, port), {})
         rec.update(host=host, port=port, token=token.hex(), mode=mode,
+                   net=net or rec.get("net") or ip_net24(host),
                    first=rec.get("first", time.time()),
                    last=time.time(), active=True)
         self.demos[self.key(host, port)] = rec

@@ -35,20 +35,33 @@ This project implements two parts:
   tokens and persists them to
   `~/.local/share/veyon-demo-viewer/demos.json`, so presentations caught
   while the GUI was closed are already there on first launch.
-- **master mode** (`master_client.py` + the *Master* page of the GUI) —
+- **screen recording** (`screen_capture.py` + `demo_server.py`,
+  two independent switches in *Impostazioni*, both **off by default**) —
+  captures your screen via the XDG ScreenCast portal + PipeWire
+  (GNOME asks consent once; the restore token is persisted).
+  *Produzione demo* runs a RFB/Veyon demo server on `:11400` broadcasting
+  your screen (token auth) so you can multicast it to clients;
+  *Inviare al master* makes the fake service answer FBURs with your real
+  screen instead of the black framebuffer — the master actually sees you.
+- **master mode** (`master_client.py` + the *Master* page of the GUI,
+  off by default — enable it from the switch in *Impostazioni*) —
   connects to other `veyon-service` instances on `:11100` like a real
   Veyon master (KeyFile RSA-PKCS1v15/SHA-512 or Logon RSA-OAEP/SHA-1 auth,
   configurable; Token fallback for custom clients), monitors their screens
-  with live thumbnails (manual IP list or `/24` subnet scan), and keeps a
-  selection of clients ready for targeted (multicast) demos. Sending
-  `StartDemoClient` is currently disabled. Invisible to official masters:
+  with live thumbnails (manual IP list or `/24` subnet scan) and offers
+  per-client actions: screenshot, text message, screen lock/unlock,
+  reboot, power down, Wake-on-LAN, remote control and `StartDemoClient`
+  multicast to the selected clients. Invisible to official masters:
   connections go straight to each client, no registration in any
   computer list.
 
 `veyondemo.py` ties them together on the command line; `veyondemo_gui.py`
 provides an Adwaita control window that keeps the service running in the
 background, shares the same token store, lists intercepted
-presentations and auto-opens the viewer on each new demo.
+presentations and auto-opens the viewer on each new demo. The demo
+history shows capture date/time and is filtered by the current `/24`
+network: demos captured on other LANs stay hidden (but not deleted)
+until you are back on that network.
 
 ## Requirements
 

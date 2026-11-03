@@ -232,7 +232,17 @@ class ClientService(threading.Thread):
     # ---- feature messages (NON inviare demo-start: vedi nota in GUI) --------
 
     def send_feature(self, fm):
-        self.sock.sendall(fm.serialize_rfb())
+        if self.sock:
+            self.sock.sendall(fm.serialize_rfb())
+
+    def send_pointer(self, mask, x, y):
+        if self.sock:
+            self.sock.sendall(struct.pack(">BBHH", 5, mask, x, y))
+
+    def send_key(self, down, keysym):
+        if self.sock:
+            self.sock.sendall(struct.pack(">BBxxI",
+                                          4, int(down), keysym))
 
     # ---- main loop ----------------------------------------------------------
 
@@ -288,3 +298,13 @@ def scan_subnet(port, on_hit, timeout=0.35, workers=64):
 
     with concurrent.futures.ThreadPoolExecutor(workers) as ex:
         list(ex.map(probe, range(1, 255)))
+
+
+def wol(mac):
+    """Wake-on-LAN magic packet su broadcast :9."""
+    mac = mac.replace(":", "").replace("-", "")
+    pkt = b"\xff" * 6 + bytes.fromhex(mac) * 16
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.sendto(pkt, ("255.255.255.255", 9))
+    s.close()

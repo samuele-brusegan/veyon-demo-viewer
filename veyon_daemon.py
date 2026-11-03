@@ -13,10 +13,13 @@ Uso: python3 veyon_daemon.py [--port 11100] [-v]
 import argparse
 import asyncio
 import logging
+import os
 
 import veyon_proto as vp
 from fake_service import ServiceCtx, run_service
-from demo_store import DemoStore, STORE_PATH
+from demo_store import DemoStore, STORE_PATH, Settings, SETTINGS_PATH, \
+    ip_net24
+from screen_capture import ScreenCapture
 
 log = logging.getLogger("veyon_daemon")
 
@@ -32,12 +35,39 @@ async def consume(events, store):
             token = fm.args.get(vp.ARG_DEMO_ACCESS_TOKEN) or b""
             mode = ("fullscreen" if fm.uid == vp.DEMO_UID_FULLSCREEN
                     else "window")
-            store.upsert(host, port, token, mode)
-            log.info("demo %s: %s:%s token %dB salvato",
-                     mode, host, port, len(token))
+            store.upsert(host, port, token, mode, net=ip_net24(peer))
+            log.info("demo %s: %s:%s token %dB salvato (rete %s)",
+                     mode, host, port, len(token), ip_net24(peer))
         elif fm.command == vp.CMD_STOP_DEMO_CLIENT:
             store.deactivate()
             log.info("demo terminata")
+
+
+async def watch_settings(ctx):
+    """Osserva settings.json: con 'record_master' attivo avvia la
+    cattura schermo e la serve ai FBUR dei master."""
+    cap = None
+    mtime = None
+    while True:
+        try:
+            mt = os.path.getmtime(SETTINGS_PATH)
+        except OSError:
+            mt = None
+        if mt != mtime:
+            mtime = mt
+            on = bool(Settings().get("record_master"))
+            if on and cap is None:
+                cap = ScreenCapture(
+                    on_status=lambda t: log.info("schermo: %s", t))
+                cap.start()
+                ctx.frame_provider = cap.get_frame
+                log.info("record_master ON — schermo servito ai master")
+            elif not on and cap is not None:
+                cap.stop()
+                cap = None
+                ctx.frame_provider = None
+                log.info("record_master OFF — framebuffer nero")
+        await asyncio.sleep(3)
 
 
 async def amain(args):
@@ -48,7 +78,8 @@ async def amain(args):
     events = asyncio.Queue()
     ctx = ServiceCtx(events, verbose=args.verbose)
     await asyncio.gather(run_service(args.port, ctx),
-                         consume(events, store))
+                         consume(events, store),
+                         watch_settings(ctx))
 
 
 def main():

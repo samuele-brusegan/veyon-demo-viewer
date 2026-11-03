@@ -230,14 +230,27 @@ class FakeServiceConnection:
 
     async def handle_fbur(self, msg):
         incremental, x, y, w, h = struct.unpack(">BHHHH", msg)
-        if incremental:
+        fb = None
+        if self.ctx.frame_provider is not None:
+            try:
+                fb = self.ctx.frame_provider()
+            except Exception:
+                fb = None
+        if fb is not None:
+            await self.send(vp.build_fb_update_rgb(
+                fb, self.ctx.fb_width, self.ctx.fb_height))
+        elif incremental:
             await self.send(vp.build_empty_fb_update())
         else:
             await self.send(vp.build_fb_update_raw(x, y, w, h, self.pix_bytes))
         if not self._said_fbur:
             self._said_fbur = True
-            self.say(f"{self.peer[0]} sta guardando l'anteprima del mio "
-                     "schermo — gli servo un'immagine nera")
+            if fb is not None:
+                self.say(f"{self.peer[0]} sta guardando l'anteprima del mio "
+                         "schermo — REGISTRAZIONE SCHERMO ATTIVA")
+            else:
+                self.say(f"{self.peer[0]} sta guardando l'anteprima del mio "
+                         "schermo — gli servo un'immagine nera")
 
     async def run(self):
         await self.handshake()
@@ -304,6 +317,7 @@ class ServiceCtx:
         self.hostname = socket.gethostname()
         self.masters = {}                    # ip -> username dei master online
         self.bridge = None                   # queue.Queue opzionale -> GUI
+        self.frame_provider = None           # callable -> np RGB o None
         import time
         self._t0 = time.monotonic()
         self.public_key_pem = self._make_public_key()

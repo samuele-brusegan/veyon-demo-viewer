@@ -22,12 +22,16 @@ import time
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib, Gtk
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 import veyon_proto as vp
 from fake_service import ServiceCtx, run_service
-from demo_store import DemoStore, STORE_PATH, Settings
-from master_client import ClientService, Credentials, scan_subnet
+from demo_store import DemoStore, STORE_PATH, Settings, \
+    ip_net24, local_net24, local_ipv4
+from master_client import ClientService, Credentials, scan_subnet, wol
+from screen_capture import ScreenCapture
+from demo_server import DemoServer, new_token
 
 log = logging.getLogger("veyondemo_gui")
 
@@ -69,17 +73,35 @@ def mark_asked():
         pass
 
 
+def daemon_running():
+    """True se un processo veyon_daemon.py e' gia' attivo."""
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    if b"veyon_daemon.py" in f.read():
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
 # ------------------------------------------------------------------ backend
 
 class Backend(threading.Thread):
     """Loop asyncio con fake service + consumatore eventi demo."""
 
-    def __init__(self, port, bridge, store, verbose):
+    def __init__(self, port, bridge, store, verbose, frame_getter=None):
         super().__init__(daemon=True, name="veyon-backend")
         self.port = port
         self.bridge = bridge            # queue.Queue -> GUI
         self.store = store
         self.verbose = verbose
+        self.frame_getter = frame_getter   # -> np RGB o None (condivisione schermo)
         self.ctx = None
 
     async def consume(self, events):
@@ -93,7 +115,8 @@ class Backend(threading.Thread):
                 token = fm.args.get(vp.ARG_DEMO_ACCESS_TOKEN) or b""
                 mode = ("fullscreen" if fm.uid == vp.DEMO_UID_FULLSCREEN
                         else "window")
-                rec = self.store.upsert(host, port, token, mode)
+                rec = self.store.upsert(host, port, token, mode,
+                                        net=ip_net24(peer))
                 self.bridge.put(("demo", rec))
             elif fm.command == vp.CMD_STOP_DEMO_CLIENT:
                 was_active = any(r.get("active")
@@ -106,6 +129,7 @@ class Backend(threading.Thread):
         events = asyncio.Queue()
         self.ctx = ServiceCtx(events, verbose=self.verbose)
         self.ctx.bridge = self.bridge
+        self.ctx.frame_provider = self.frame_getter
 
         async def main():
             await asyncio.gather(run_service(self.port, self.ctx),
@@ -149,6 +173,12 @@ class DemoApp(Adw.Application):
         self.client_svcs = {}
         self.client_rows = {}
         self._last_frame = {}
+        self._store_mtime = None
+        self.demo_targets = set()       # ip a cui abbiamo inviato una demo
+        self._demo_uid = None           # uid usato per l'ultimo StartDemoClient
+        self.capture = None             # ScreenCapture condiviso
+        self.demo_server = None         # DemoServer (produzione)
+        self.demo_token = None
 
     # ---- costruzione UI ------------------------------------------------------
 
@@ -187,6 +217,9 @@ class DemoApp(Adw.Application):
         self.stack.add_titled_with_icon(self._build_master_page(),
                                         "master", "Master",
                                         "system-users-symbolic")
+        self.stack.add_titled_with_icon(self._build_settings_page(),
+                                        "settings", "Impostazioni",
+                                        "emblem-system-symbolic")
 
         # -- gruppo stato --
         grp = Adw.PreferencesGroup(title="Servizio")
@@ -194,7 +227,8 @@ class DemoApp(Adw.Application):
         self.svc_row = Adw.ActionRow(
             title="Fake service",
             subtitle=f"in ascolto sulla porta {self.args.port}")
-        self.svc_row.set_icon_name("network-server-symbolic")
+        self.svc_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "network-server-symbolic"))
         self.svc_lbl = Gtk.Label(label="avvio…")
         self.svc_lbl.add_css_class("dim-label")
         self.svc_lbl.set_valign(Gtk.Align.CENTER)
@@ -203,13 +237,15 @@ class DemoApp(Adw.Application):
 
         self.masters_row = Adw.ActionRow(
             title="Master connessi", subtitle="nessuno")
-        self.masters_row.set_icon_name("system-users-symbolic")
+        self.masters_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "system-users-symbolic"))
         grp.add(self.masters_row)
 
         self.daemon_row = Adw.ActionRow(
             title="Daemon al login",
             subtitle="cattura i token demo anche ad app chiusa")
-        self.daemon_row.set_icon_name("emblem-system-symbolic")
+        self.daemon_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "emblem-system-symbolic"))
         self.daemon_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.daemon_sw.set_active(os.path.exists(AUTOSTART_PATH))
         self.daemon_sw.connect("notify::active", self._on_daemon_sw)
@@ -224,16 +260,31 @@ class DemoApp(Adw.Application):
         self.auto_row = Adw.ActionRow(
             title="Apertura automatica",
             subtitle="apre il viewer a ogni nuova presentazione")
-        self.auto_row.set_icon_name("media-playback-start-symbolic")
+        self.auto_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "media-playback-start-symbolic"))
         self.auto_sw = Gtk.Switch(active=True, valign=Gtk.Align.CENTER)
         self.auto_row.add_suffix(self.auto_sw)
         self.auto_row.set_activatable_widget(self.auto_sw)
         self.demo_grp.add(self.auto_row)
 
+        self.viewer_row = Adw.ActionRow(
+            title="Riproduzione", subtitle="nessuna demo in corso")
+        self.viewer_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "media-playback-pause-symbolic"))
+        self.viewer_stop = Gtk.Button(label="Ferma",
+                                      valign=Gtk.Align.CENTER,
+                                      sensitive=False)
+        self.viewer_stop.add_css_class("destructive-action")
+        self.viewer_stop.set_tooltip_text("chiude il viewer demo")
+        self.viewer_stop.connect("clicked", self._on_stop_viewer)
+        self.viewer_row.add_suffix(self.viewer_stop)
+        self.demo_grp.add(self.viewer_row)
+
         self.empty_row = Adw.ActionRow(
             title="Nessuna presentazione intercettata",
             subtitle="in attesa di StartDemoClient dal master")
-        self.empty_row.set_icon_name("video-display-symbolic")
+        self.empty_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "video-display-symbolic"))
         self.empty_row.set_sensitive(False)
         self.demo_grp.add(self.empty_row)
 
@@ -241,7 +292,8 @@ class DemoApp(Adw.Application):
 
         # -- gruppo log --
         self.log_grp = Adw.ExpanderRow(title="Registro eventi")
-        self.log_grp.set_icon_name("text-x-generic-symbolic")
+        self.log_grp.add_prefix(Gtk.Image.new_from_icon_name(
+            "text-x-generic-symbolic"))
         self.log_grp.set_show_enable_switch(False)
 
         scrolled = Gtk.ScrolledWindow(min_content_height=150,
@@ -265,7 +317,8 @@ class DemoApp(Adw.Application):
 
         # backend asyncio in thread
         self.backend = Backend(self.args.port, self.bridge, self.store,
-                               self.args.verbose)
+                               self.args.verbose,
+                               frame_getter=self._service_frame)
         self.backend.start()
 
         handler = LogBridge(self.bridge)
@@ -274,10 +327,20 @@ class DemoApp(Adw.Application):
         logging.getLogger().addHandler(handler)
 
         GLib.timeout_add(150, self._poll_bridge)
+        GLib.timeout_add(500, self._check_viewer)
+        GLib.timeout_add(2000, self._reload_store)
         for rec in self.store.sorted():
             self.add_row(rec)
         self.log_line(f"in ascolto su :{self.args.port} — "
                       "attendo il veyon-master")
+
+        act = Gio.SimpleAction.new("client", GLib.VariantType.new("s"))
+        act.connect("activate",
+                    lambda _a, p: self._client_action(p.get_string()))
+        self.add_action(act)
+        self._apply_master_enabled()
+        self._apply_record_demo()
+        self._apply_record_master()
 
         if not os.path.exists(AUTOSTART_PATH) and \
                 not os.path.exists(DAEMON_ASKED):
@@ -330,7 +393,8 @@ class DemoApp(Adw.Application):
         grp = Adw.PreferencesGroup(title="Credenziali")
         self.cred_row = Adw.ActionRow(title="Autenticazione master",
                                     subtitle=self._cred_desc())
-        self.cred_row.set_icon_name("dialog-password-symbolic")
+        self.cred_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "dialog-password-symbolic"))
         btn = Gtk.Button(label="Configura…", valign=Gtk.Align.CENTER)
         btn.connect("clicked", self._on_cred_edit)
         self.cred_row.add_suffix(btn)
@@ -362,26 +426,399 @@ class DemoApp(Adw.Application):
         content.append(self.clients_grp)
 
         demo_grp = Adw.PreferencesGroup(title="Demo multicast")
+        self.demo_src = Adw.EntryRow(
+            title="Sorgente manuale (host:porta [token-hex])")
+        demo_grp.add(self.demo_src)
         row = Adw.ActionRow(
             title="Invia demo ai selezionati",
-            subtitle="disabilitato — nessun StartDemoClient verrà inviato")
-        row.set_icon_name("media-playback-start-symbolic")
+            subtitle="sorgente manuale, altrimenti l'ultima demo attiva")
+        row.add_prefix(Gtk.Image.new_from_icon_name(
+            "media-playback-start-symbolic"))
         send = Gtk.Button(label="Invia", valign=Gtk.Align.CENTER)
-        send.set_sensitive(False)
+        send.add_css_class("suggested-action")
+        send.connect("clicked", self._on_send_demo)
         row.add_suffix(send)
         demo_grp.add(row)
+
+        self.demo_state_row = Adw.ActionRow(
+            title="Demo inviata", subtitle="nessuna")
+        self.demo_state_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "media-playback-stop-symbolic"))
+        self.demo_stop_btn = Gtk.Button(
+            label="Stop", valign=Gtk.Align.CENTER, sensitive=False)
+        self.demo_stop_btn.add_css_class("destructive-action")
+        self.demo_stop_btn.set_tooltip_text(
+            "invia StopDemoClient ai client")
+        self.demo_stop_btn.connect("clicked", self._on_stop_demo)
+        self.demo_state_row.add_suffix(self.demo_stop_btn)
+        demo_grp.add(self.demo_state_row)
         content.append(demo_grp)
 
         for ip in self.settings.clients():
             self._add_client_row(ip)
         return scroll
 
+    # ---- pagina impostazioni -------------------------------------------------
+
+    def _build_settings_page(self):
+        scroll = Gtk.ScrolledWindow()
+        clamp = Adw.Clamp(maximum_size=560)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(content, f"set_margin_{m}")(18)
+        clamp.set_child(content)
+        scroll.set_child(clamp)
+
+        grp = Adw.PreferencesGroup(title="Funzionalità")
+        row = Adw.ActionRow(
+            title="Modalità master",
+            subtitle="monitoring client, demo multicast e comandi remoti")
+        row.add_prefix(Gtk.Image.new_from_icon_name(
+            "system-users-symbolic"))
+        sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        sw.set_active(bool(self.settings.get("master_enabled")))
+        sw.connect("notify::active", self._on_master_sw)
+        row.add_suffix(sw)
+        row.set_activatable_widget(sw)
+        grp.add(row)
+        content.append(grp)
+
+        rec_grp = Adw.PreferencesGroup(title="Registrazione schermo")
+        self.rec_demo_row = Adw.ActionRow(
+            title="Produzione demo",
+            subtitle="demo server su :11400 col tuo schermo — OFF")
+        self.rec_demo_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "media-record-symbolic"))
+        self.rec_demo_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.rec_demo_sw.set_active(bool(self.settings.get("record_demo")))
+        self.rec_demo_sw.connect("notify::active", self._on_record_demo_sw)
+        self.rec_demo_row.add_suffix(self.rec_demo_sw)
+        self.rec_demo_row.set_activatable_widget(self.rec_demo_sw)
+        rec_grp.add(self.rec_demo_row)
+
+        self.rec_master_row = Adw.ActionRow(
+            title="Inviare al master/docente",
+            subtitle="i master vedono il tuo schermo reale, non nero — OFF")
+        self.rec_master_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "camera-video-symbolic"))
+        self.rec_master_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.rec_master_sw.set_active(
+            bool(self.settings.get("record_master")))
+        self.rec_master_sw.connect("notify::active",
+                                   self._on_record_master_sw)
+        self.rec_master_row.add_suffix(self.rec_master_sw)
+        self.rec_master_row.set_activatable_widget(self.rec_master_sw)
+        rec_grp.add(self.rec_master_row)
+        content.append(rec_grp)
+        return scroll
+
+    def _on_master_sw(self, sw, _pspec):
+        self.settings.set("master_enabled", sw.get_active())
+        self._apply_master_enabled()
+        self.log_line("modalità master " +
+                      ("attiva" if sw.get_active() else "disattivata"))
+
+    def _apply_master_enabled(self):
+        on = bool(self.settings.get("master_enabled"))
+        page = self.stack.get_child_by_name("master")
+        if page is not None:
+            if not on and self.stack.get_visible_child() is page:
+                self.stack.set_visible_child_name("demo")
+            self.stack.get_page(page).set_visible(on)
+        for ip in self.client_rows:
+            if on:
+                self._start_client(ip)
+            else:
+                self.client_rows[ip][0].set_subtitle("master disabilitato")
+        if not on:
+            for svc in self.client_svcs.values():
+                svc.stop_flag = True
+            self.client_svcs.clear()
+            self.demo_targets.clear()
+            self._update_demo_state()
+
+    # ---- registrazione schermo ----------------------------------------------
+
+    def _on_record_demo_sw(self, sw, _pspec):
+        self.settings.set("record_demo", sw.get_active())
+        self._apply_record_demo()
+
+    def _on_record_master_sw(self, sw, _pspec):
+        self.settings.set("record_master", sw.get_active())
+        self._apply_record_master()
+        self.log_line("registrazione schermo per il master " +
+                      ("attiva" if sw.get_active() else "disattivata"))
+
+    def _cap_status(self, text):
+        GLib.idle_add(self.log_line, f"schermo: {text}")
+
+    def _ensure_capture(self):
+        if self.capture is None:
+            self.capture = ScreenCapture(on_status=self._cap_status)
+        self.capture.start()
+
+    def _maybe_stop_capture(self):
+        if (self.capture and
+                not self.settings.get("record_demo") and
+                not self.settings.get("record_master")):
+            self.capture.stop()
+            self.capture = None
+
+    def _service_frame(self):
+        """frame_provider del fake service: schermo reale solo se lo
+        switch 'inviare al master' e' attivo."""
+        if self.settings.get("record_master") and self.capture:
+            return self.capture.get_frame()
+        return None
+
+    def _apply_record_master(self):
+        if self.settings.get("record_master"):
+            self._ensure_capture()
+            self.rec_master_row.set_subtitle(
+                "schermo visibile ai master connessi — ON")
+        else:
+            self.rec_master_row.set_subtitle(
+                "i master vedono il tuo schermo reale, non nero — OFF")
+        self._maybe_stop_capture()
+
+    def _apply_record_demo(self):
+        if self.settings.get("record_demo"):
+            self._ensure_capture()
+            if self.demo_server is None:
+                self.demo_token = new_token()
+                self.demo_server = DemoServer(
+                    11400, self.capture.get_frame, self.demo_token,
+                    on_status=self._cap_status)
+                self.demo_server.start()
+            ip = local_ipv4() or "127.0.0.1"
+            self.rec_demo_row.set_subtitle(
+                f"in onda su {ip}:11400 — token {self.demo_token.hex()[:8]}…")
+            if not self.demo_src.get_text().strip():
+                self.demo_src.set_text(
+                    f"{ip}:11400 {self.demo_token.hex()}")
+            self.log_line(f"demo server attivo su {ip}:11400")
+        else:
+            if self.demo_server:
+                self.demo_server.stop()
+                self.demo_server = None
+                self.demo_token = None
+            self.rec_demo_row.set_subtitle(
+                "demo server su :11400 col tuo schermo — OFF")
+        self._maybe_stop_capture()
+
+    # ---- azioni sui client --------------------------------------------------
+
+    def _client_action(self, param):
+        act, ip = param.split("|", 1)
+        svc = self.client_svcs.get(ip)
+        if act == "shot":
+            self._save_shot(ip, svc.fb if svc else None)
+        elif act == "msg":
+            self._ask_text(ip, "Messaggio", "Invia", self._send_msg)
+        elif act in ("lock", "unlock", "reboot", "powerdown"):
+            fm = {
+                "lock": vp.FeatureMessage(vp.UID_SCREEN_LOCK, 0, {}),
+                "unlock": vp.FeatureMessage(vp.UID_SCREEN_LOCK,
+                                            vp.CMD_LOCK_STOP, {}),
+                "reboot": vp.FeatureMessage(vp.UID_POWER_REBOOT, 0, {}),
+                "powerdown": vp.FeatureMessage(vp.UID_POWER_DOWN, 0, {}),
+            }[act]
+            if svc:
+                svc.send_feature(fm)
+            self.log_line(f"{act} → {ip}")
+        elif act == "wol":
+            self._ask_text(ip, "MAC address (AA:BB:CC:DD:EE:FF)", "WoL",
+                           self._send_wol)
+        elif act == "control":
+            self._open_control(ip)
+
+    def _save_shot(self, ip, fb):
+        if fb is None:
+            self.log_line(f"{ip}: nessun frame da salvare")
+            return
+        h, w, _ = fb.shape
+        pb = GdkPixbuf.Pixbuf.new_from_bytes(
+            GLib.Bytes.new(fb.tobytes()), GdkPixbuf.Colorspace.RGB,
+            False, 8, w, h, w * 3)
+        pics = os.path.join(os.path.expanduser("~"), "Pictures")
+        os.makedirs(pics, exist_ok=True)
+        path = os.path.join(pics, f"veyon-{ip}-{int(time.time())}.png")
+        pb.savev(path, "png", [], [])
+        self.log_line(f"screenshot {ip} → {path}")
+
+    def _ask_text(self, ip, title, btn_label, cb):
+        dlg = Adw.Dialog(title=title, content_width=380)
+        tvw = Adw.ToolbarView()
+        tvw.add_top_bar(Adw.HeaderBar())
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(18)
+        e = Gtk.Entry()
+        box.append(e)
+        btn = Gtk.Button(label=btn_label, halign=Gtk.Align.END)
+        btn.add_css_class("suggested-action")
+        btn.connect("clicked", lambda *_: (cb(ip, e.get_text()), dlg.close()))
+        box.append(btn)
+        tvw.set_content(box)
+        dlg.set_child(tvw)
+        dlg.present(self.win)
+
+    def _send_msg(self, ip, text):
+        if not text:
+            return
+        svc = self.client_svcs.get(ip)
+        if svc:
+            svc.send_feature(vp.FeatureMessage(
+                vp.UID_TEXT_MESSAGE, 0,
+                {vp.ARG_TEXT: text, vp.ARG_ICON: 1}))
+        self.log_line(f"messaggio → {ip}")
+
+    def _send_wol(self, ip, mac):
+        if not mac:
+            return
+        try:
+            wol(mac)
+            self.log_line(f"WoL → {mac}")
+        except Exception as e:
+            self.log_line(f"WoL fallito: {e}")
+
+    # ---- demo multicast -----------------------------------------------------
+
+    def _on_send_demo(self, *_):
+        targets = [ip for ip, (_r, _p, chk) in self.client_rows.items()
+                   if chk.get_active()]
+        src = self.demo_src.get_text().strip()
+        rec = None
+        if src:
+            try:
+                parts = src.split()
+                host, port = parts[0].rsplit(":", 1)
+                rec = {"host": host, "port": int(port),
+                       "token": (parts[1] if len(parts) > 1 else ""),
+                       "mode": "window"}
+                bytes.fromhex(rec["token"] or "00")
+            except ValueError:
+                self.log_line("sorgente demo non valida "
+                              "(formato host:porta [token-hex])")
+                return
+        else:
+            rec = next((r for r in self.store.sorted()
+                        if r.get("active") and self._rec_visible(r)), None)
+        if not targets:
+            self.log_line("demo: nessun client selezionato")
+        elif rec is None:
+            self.log_line("demo: nessuna demo attiva da inoltrare — "
+                          "usa la sorgente manuale")
+        else:
+            uid = (vp.DEMO_UID_FULLSCREEN if rec["mode"] == "fullscreen"
+                   else vp.DEMO_UID_WINDOW)
+            fm = vp.FeatureMessage(uid, vp.CMD_START_DEMO_CLIENT, {
+                vp.ARG_DEMO_ACCESS_TOKEN: bytes.fromhex(rec["token"] or ""),
+                vp.ARG_DEMO_SERVER_HOST: rec["host"],
+                vp.ARG_DEMO_SERVER_PORT: int(rec["port"])})
+            sent = 0
+            for ip in targets:
+                svc = self.client_svcs.get(ip)
+                if svc and svc.sock:
+                    svc.send_feature(fm)
+                    self.demo_targets.add(ip)
+                    sent += 1
+                else:
+                    self.log_line(f"demo: {ip} non connesso — saltato")
+            if sent:
+                self._demo_uid = uid
+            self._update_demo_state()
+            self.log_line(
+                f"demo {rec['host']}:{rec['port']} → {sent} client")
+
+    def _update_demo_state(self):
+        if self.demo_targets:
+            self.demo_state_row.set_subtitle(
+                "in corso su " + ", ".join(sorted(self.demo_targets)))
+            self.demo_stop_btn.set_sensitive(True)
+        else:
+            self.demo_state_row.set_subtitle("nessuna")
+            self.demo_stop_btn.set_sensitive(False)
+
+    def _on_stop_demo(self, *_):
+        uid = self._demo_uid or vp.DEMO_UID_WINDOW
+        fm = vp.FeatureMessage(uid, vp.CMD_STOP_DEMO_CLIENT, {})
+        stopped = 0
+        for ip in sorted(self.demo_targets):
+            svc = self.client_svcs.get(ip)
+            if svc and svc.sock:
+                svc.send_feature(fm)
+                stopped += 1
+            else:
+                self.log_line(f"stop demo: {ip} non connesso — saltato")
+        self.demo_targets.clear()
+        self._update_demo_state()
+        self.log_line(f"stop demo → {stopped} client")
+
+    # ---- controllo remoto ----------------------------------------------------
+
+    def _open_control(self, ip):
+        svc = self.client_svcs.get(ip)
+        if svc is None or svc.fb is None:
+            self.log_line(f"{ip}: non connesso, controllo impossibile")
+            return
+        if getattr(self, "_ctrl", None):
+            self._ctrl["win"].close()
+        win = Gtk.Window(title=f"Controllo — {ip}", transient_for=self.win)
+        win.set_default_size(960, 600)
+        pic = Gtk.Picture()
+        pic.set_can_shrink(True)
+        win.set_child(pic)
+
+        btns = [0]
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", lambda _c, x, y:
+                       svc.send_pointer(btns[0], *self._ctrl_xy(pic, svc, x, y)))
+        win.add_controller(motion)
+        click = Gtk.GestureClick()
+        click.set_button(0)
+        click.connect("pressed", lambda _g, _n, x, y, b=None:
+                      self._ctrl_btn(svc, btns, x, y, True))
+        click.connect("released", lambda _g, _n, x, y, b=None:
+                      self._ctrl_btn(svc, btns, x, y, False))
+        win.add_controller(click)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, kv, _k, _s:
+                     (svc.send_key(True, kv), True)[1])
+        keys.connect("key-released", lambda _c, kv, _k, _s:
+                     svc.send_key(False, kv))
+        win.add_controller(keys)
+        win.connect("close-request", lambda *_: setattr(
+            self, "_ctrl", None) or False)
+        self._ctrl = {"ip": ip, "win": win, "pic": pic}
+        self._paint_client(ip, svc.fb)
+        win.present()
+
+    def _ctrl_xy(self, pic, svc, x, y):
+        fh, fw = svc.fb.shape[:2]
+        pw, ph = max(1, pic.get_width()), max(1, pic.get_height())
+        return (min(fw - 1, int(x / pw * fw)),
+                min(fh - 1, int(y / ph * fh)))
+
+    def _ctrl_btn(self, svc, btns, x, y, down):
+        b = 1
+        if down:
+            btns[0] |= b
+        else:
+            btns[0] &= ~b
+        svc.send_pointer(btns[0], *self._ctrl_xy(self._ctrl["pic"], svc, x, y))
+
     def _cred_desc(self):
-        if self.settings.get("key_file"):
-            return f"KeyFile: {os.path.basename(self.settings.get('key_file'))}"
-        if self.settings.get("password"):
-            return f"Logon: {self.settings.get('username') or '?'}"
-        return "nessuna — solo client custom / tentativo anonimo"
+        parts = []
+        if self.creds.key_file:
+            kn = self.creds.key_name or \
+                os.path.basename(self.creds.key_file)
+            parts.append(f"KeyFile: {kn}")
+        if self.creds.username:
+            parts.append(f"Logon: {self.creds.username}")
+        if not parts:
+            return "nessuna — chiave effimera (solo client custom)"
+        return " · ".join(parts)
 
     def _on_cred_edit(self, *_):
         dlg = Adw.Dialog(title="Credenziali master", content_width=420)
@@ -434,7 +871,17 @@ class DemoApp(Adw.Application):
 
         def work():
             n = [0]
+            import socket as _s
+            my_ip = None
+            try:
+                with _s.socket(_s.AF_INET, _s.SOCK_DGRAM) as _sock:
+                    _sock.connect(("192.0.2.1", 80))
+                    my_ip = _sock.getsockname()[0]
+            except OSError:
+                pass
             def hit(ip):
+                if ip == my_ip:
+                    return              # il nostro daemon: non e' un client
                 n[0] += 1
                 GLib.idle_add(self._add_client_row, ip)
             try:
@@ -454,7 +901,8 @@ class DemoApp(Adw.Application):
             return
         self.empty_clients_row.set_visible(False)
         row = Adw.ActionRow(title=ip, subtitle="connessione…")
-        row.set_icon_name("computer-symbolic")
+        row.add_prefix(Gtk.Image.new_from_icon_name(
+            "computer-symbolic"))
         pic = Gtk.Picture()
         pic.set_size_request(96, 54)
         pic.set_can_shrink(True)
@@ -462,6 +910,24 @@ class DemoApp(Adw.Application):
         chk = Gtk.CheckButton(valign=Gtk.Align.CENTER)
         chk.set_tooltip_text("seleziona per demo multicast")
         row.add_suffix(chk)
+        menu = Gio.Menu()
+        for label, act in (("Screenshot", "shot"),
+                           ("Messaggio…", "msg"),
+                           ("Blocca schermo", "lock"),
+                           ("Sblocca", "unlock"),
+                           ("Riavvia", "reboot"),
+                           ("Spegni", "powerdown"),
+                           ("Wake-on-LAN…", "wol"),
+                           ("Controllo remoto", "control")):
+            it = Gio.MenuItem.new(label, "app.client")
+            it.set_attribute_value(
+                "target", GLib.Variant.new_string(f"{act}|{ip}"))
+            menu.append_item(it)
+        mb = Gtk.MenuButton(icon_name="open-menu-symbolic",
+                            valign=Gtk.Align.CENTER)
+        mb.add_css_class("flat")
+        mb.set_menu_model(menu)
+        row.add_suffix(mb)
         rm = Gtk.Button(icon_name="user-trash-symbolic",
                         valign=Gtk.Align.CENTER)
         rm.add_css_class("flat")
@@ -511,13 +977,15 @@ class DemoApp(Adw.Application):
         GLib.idle_add(self._paint_client, ip, fb)
 
     def _paint_client(self, ip, fb):
-        if ip not in self.client_rows:
-            return
         h, w, _ = fb.shape
         tex = Gdk.MemoryTexture.new(
             w, h, Gdk.MemoryFormat.R8G8B8,
             GLib.Bytes.new(fb.tobytes()), w * 3)
-        self.client_rows[ip][1].set_paintable(tex)
+        if ip in self.client_rows:
+            self.client_rows[ip][1].set_paintable(tex)
+        ctrl = getattr(self, "_ctrl", None)
+        if ctrl and ctrl["ip"] == ip:
+            ctrl["pic"].set_paintable(tex)
 
     # ---- helpers UI ---------------------------------------------------------
 
@@ -527,21 +995,46 @@ class DemoApp(Adw.Application):
         mark = buf.create_mark(None, buf.get_end_iter(), False)
         self.logview.scroll_to_mark(mark, 0.0, False, 0.0, 1.0)
 
+    @staticmethod
+    def _rec_net(rec):
+        """Rete di provenienza del record: quella salvata alla cattura,
+        altrimenti dedotta dall'IP del demo server (record vecchi)."""
+        return rec.get("net") or ip_net24(rec.get("host"))
+
+    def _rec_visible(self, rec):
+        """Mostra solo le demo catturate sulla rete /24 corrente."""
+        cur = local_net24()
+        if cur is None:
+            return True                 # rete ignota: non filtrare
+        rn = self._rec_net(rec)
+        return rn is None or rn == cur
+
     def add_row(self, rec):
         key = DemoStore.key(rec["host"], rec["port"])
         old = self.rows.pop(key, None)
         if old is not None:
             self.demo_grp.remove(old)
+        if not self._rec_visible(rec):
+            if not self.rows:
+                self.empty_row.set_title("Nessuna demo su questa rete")
+                self.empty_row.set_subtitle(
+                    "le demo catturate su altre reti sono nascoste")
+                self.empty_row.set_visible(True)
+            return
+        self.empty_row.set_title("Nessuna presentazione intercettata")
+        self.empty_row.set_subtitle(
+            "in attesa di StartDemoClient dal master")
         self.empty_row.set_visible(False)
 
         mode = "schermo intero" if rec["mode"] == "fullscreen" else "finestra"
-        ts = time.strftime("%H:%M", time.localtime(rec["last"]))
+        dt = time.strftime("%d/%m/%Y %H:%M", time.localtime(rec["last"]))
         active = rec.get("active")
 
         row = Adw.ActionRow(title=f"{rec['host']}:{rec['port']}")
-        row.set_icon_name("video-display-symbolic")
+        row.add_prefix(Gtk.Image.new_from_icon_name(
+            "video-display-symbolic"))
         row.set_subtitle(
-            f"{mode} · token delle {ts} · "
+            f"{mode} · {dt} · "
             f"{'attiva' if active else 'terminata'}")
 
         if active:
@@ -559,6 +1052,32 @@ class DemoApp(Adw.Application):
         self.demo_grp.add(row)
         self.rows[key] = row
 
+    def _check_viewer(self):
+        """Rileva la chiusura manuale del viewer (Esc/q/Alt-F4)."""
+        if self.viewer_proc is not None and \
+                self.viewer_proc.poll() is not None:
+            self.viewer_proc = None
+            self.viewer_key = None
+            self._update_viewer_row()
+            self.log_line("viewer chiuso")
+        return True
+
+    def _update_viewer_row(self):
+        running = self.viewer_proc is not None and \
+            self.viewer_proc.poll() is None
+        if running and self.viewer_key:
+            host, port, _ = self.viewer_key
+            self.viewer_row.set_subtitle(
+                f"demo in corso — {host}:{port}")
+            self.viewer_stop.set_sensitive(True)
+        else:
+            self.viewer_row.set_subtitle("nessuna demo in corso")
+            self.viewer_stop.set_sensitive(False)
+
+    def _on_stop_viewer(self, *_):
+        self.kill_viewer()
+        self.log_line("riproduzione fermata manualmente")
+
     def open_viewer(self, rec):
         key = (rec["host"], int(rec["port"]), rec["token"])
         if self.viewer_key == key and self.viewer_proc is not None \
@@ -573,6 +1092,7 @@ class DemoApp(Adw.Application):
              rec["host"], str(rec["port"]), rec["token"]],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.viewer_key = key
+        self._update_viewer_row()
 
     def kill_viewer(self):
         self.viewer_key = None
@@ -583,8 +1103,33 @@ class DemoApp(Adw.Application):
             except subprocess.TimeoutExpired:
                 self.viewer_proc.kill()
         self.viewer_proc = None
+        self._update_viewer_row()
 
     # ---- bridge poll ---------------------------------------------------------
+
+    def _reload_store(self):
+        """Rileva le scritture del daemon (o di un'altra istanza) sullo
+        store condiviso e ricostruisce la lista demo."""
+        try:
+            mt = os.path.getmtime(self.store.path)
+        except OSError:
+            mt = None
+        if mt == self._store_mtime:
+            return True
+        self._store_mtime = mt
+        self.store.load()
+        for row in self.rows.values():
+            self.demo_grp.remove(row)
+        self.rows.clear()
+        if not self.store.demos:
+            self.empty_row.set_title("Nessuna presentazione intercettata")
+            self.empty_row.set_subtitle(
+                "in attesa di StartDemoClient dal master")
+            self.empty_row.set_visible(True)
+            return True
+        for rec in self.store.sorted():
+            self.add_row(rec)
+        return True
 
     def _poll_bridge(self):
         try:
@@ -626,13 +1171,25 @@ class DemoApp(Adw.Application):
             for rec in self.store.sorted():
                 self.add_row(rec)
         elif kind == "fatal":
-            self.svc_lbl.set_text("errore")
-            self.svc_lbl.add_css_class("error")
-            self.log_line(f"FATALE: {payload['error']}")
-            if "98" in payload["error"]:
+            err = payload["error"]
+            if "98" in err and daemon_running():
+                self.svc_lbl.set_text("daemon attivo")
+                self.svc_lbl.remove_css_class("dim-label")
+                self.svc_lbl.add_css_class("success")
+                self.status_dot.add_css_class("success")
+                self.svc_row.set_title("Cattura demo")
                 self.svc_row.set_subtitle(
-                    "porta occupata — il daemon veyon_daemon.py "
-                    "o un'altra istanza è già attivo")
+                    "gestita dal daemon in background su "
+                    f":{self.args.port} — elenco in sola lettura")
+                self.log_line(f":{self.args.port} occupata dal daemon — "
+                              "seguo lo store condiviso")
+            else:
+                self.svc_lbl.set_text("errore")
+                self.svc_lbl.add_css_class("error")
+                self.log_line(f"FATALE: {err}")
+                if "98" in err:
+                    self.svc_row.set_subtitle(
+                        "porta occupata — un'altra istanza è già attiva")
 
     def _refresh_masters(self):
         ctx = self.backend.ctx if self.backend else None
@@ -644,6 +1201,10 @@ class DemoApp(Adw.Application):
     def _on_close(self, *_):
         for svc in self.client_svcs.values():
             svc.stop_flag = True
+        if self.demo_server:
+            self.demo_server.stop()
+        if self.capture:
+            self.capture.stop()
         self.kill_viewer()
         return False
 
