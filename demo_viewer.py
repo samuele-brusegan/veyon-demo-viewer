@@ -35,6 +35,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
 import veyon_proto as vp
+from window_icon import set_x11_window_icon
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_ID = "dev.local.veyon-demo-viewer"
@@ -108,8 +109,7 @@ def install_icon():
 
 
 def install_desktop_entry():
-    """~/.local/share/applications/<app_id>.desktop: senza questo GNOME
-    non associa la finestra a un'app (icona/nome di fallback in Alt-Tab)."""
+    """Installa la voce usata dai desktop per associare l'icona alla finestra."""
     apps = os.path.expanduser("~/.local/share/applications")
     try:
         os.makedirs(apps, exist_ok=True)
@@ -117,9 +117,10 @@ def install_desktop_entry():
             f.write("[Desktop Entry]\n"
                     "Type=Application\n"
                     "Name=Veyon (demo)\n"
-                    "Icon=veyon-demo-viewer\n"
-                    f"Exec={sys.executable} "
-                    f"{os.path.join(HERE, 'demo_viewer.py')}\n"
+                    f"Icon={os.path.join(HERE, 'assets', 'icon.svg')}\n"
+                    f"StartupWMClass={APP_ID}\n"
+                    f"Exec=\"{sys.executable}\" "
+                    f"\"{os.path.join(HERE, 'demo_viewer.py')}\"\n"
                     "Terminal=false\n"
                     "NoDisplay=true\n")
     except OSError:
@@ -520,6 +521,8 @@ class DemoApp(Gtk.Application):
         if surface is None:
             return True                      # non ancora mappata: riprova
         try:
+            set_x11_window_icon(
+                self.win, os.path.join(HERE, "assets", "icon.svg"))
             set_wm_state(surface.get_xid(), "_NET_WM_STATE_ABOVE",
                          "_NET_WM_STATE_STICKY")
         except Exception as e:

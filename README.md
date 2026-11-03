@@ -68,6 +68,11 @@ until you are back on that network.
 - Python 3.11+ with `gi` (PyGObject), GTK4, libadwaita, NumPy
 - TCP connectivity to the Veyon master on port 11100 (your host must be
   registered in the master's computer list)
+- GNOME, XFCE, or another GTK desktop; XFCE needs GTK4 and libadwaita runtime
+
+The GUI keeps its Adwaita layout on XFCE. It uses XFCE's window controls,
+registers desktop entries against each GTK application ID, and publishes the
+matching `assets` SVG as the X11 window icon.
 
 ## Usage
 
