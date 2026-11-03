@@ -65,3 +65,44 @@ class DemoStore:
     def sorted(self):
         return sorted(self.demos.values(),
                       key=lambda r: r.get("last", 0), reverse=True)
+
+
+SETTINGS_PATH = os.path.expanduser(
+    "~/.local/share/veyon-demo-viewer/settings.json")
+
+
+class Settings:
+    """Impostazioni persistenti (credenziali master, lista client)."""
+
+    def __init__(self, path=SETTINGS_PATH):
+        self.path = path
+        self.data = {}
+        try:
+            with open(path) as f:
+                self.data = json.load(f)
+        except Exception:
+            self.data = {}
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.data, f, indent=1)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log.warning("settings: salvataggio fallito: %s", e)
+
+    def get(self, key, default=""):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.save()
+
+    def clients(self):
+        return self.data.get("clients", [])
+
+    def set_clients(self, ips):
+        self.data["clients"] = ips
+        self.save()

@@ -27,13 +27,23 @@ This project implements two parts:
   the broadcast RFB stream (Tight encoding: fill, JPEG, copy/palette/gradient
   filters, persistent zlib streams; plus raw/copyrect and UltraVNC
   pseudo-encodings) and renders it in a minimal, borderless, PiP-style GTK4
-  window: drag it anywhere, `Esc`/`q` closes it. Resilient to demo-server
+  window — always on top and on every workspace (via XWayland on Wayland
+  sessions): drag it anywhere, `Esc`/`q` closes it. Resilient to demo-server
   resyncs and mid-stream joins; auto-reconnects.
 - **daemon** (`veyon_daemon.py`) — a minimal background service: the fake
   service without GUI and without viewer. It captures `StartDemoClient`
   tokens and persists them to
   `~/.local/share/veyon-demo-viewer/demos.json`, so presentations caught
   while the GUI was closed are already there on first launch.
+- **master mode** (`master_client.py` + the *Master* page of the GUI) —
+  connects to other `veyon-service` instances on `:11100` like a real
+  Veyon master (KeyFile RSA-PKCS1v15/SHA-512 or Logon RSA-OAEP/SHA-1 auth,
+  configurable; Token fallback for custom clients), monitors their screens
+  with live thumbnails (manual IP list or `/24` subnet scan), and keeps a
+  selection of clients ready for targeted (multicast) demos. Sending
+  `StartDemoClient` is currently disabled. Invisible to official masters:
+  connections go straight to each client, no registration in any
+  computer list.
 
 `veyondemo.py` ties them together on the command line; `veyondemo_gui.py`
 provides an Adwaita control window that keeps the service running in the

@@ -1,12 +1,14 @@
 """demo_viewer.py - viewer per il demo server Veyon.
 
 Si connette a host:porta con auth a token e mostra lo schermo condiviso in
-una finestrella GTK4 stile PiP: senza decorazioni, trascinabile con il
+una finestrella GTK4 stile PiP: senza decorazioni, sempre in primo piano e
+su tutti i desktop (via XWayland su sessioni Wayland), trascinabile con il
 mouse, chiusura con Esc/q (o Alt-F4 / taskbar).
 
 Uso: python3 demo_viewer.py <host> <porta> <token_hex>
 """
 
+import ctypes
 import os
 import shutil
 import socket
@@ -16,6 +18,13 @@ import sys
 import threading
 import time
 import zlib
+
+# always-on-top/sticky sono hint EWMH (X11): su Wayland non esiste modo
+# nativo, quindi si forza XWayland quando c'e' un DISPLAY — PRIMA di
+# importare gi, che sceglie il backend all'import
+if os.environ.get("XDG_SESSION_TYPE") == "wayland" and \
+        os.environ.get("DISPLAY"):
+    os.environ.setdefault("GDK_BACKEND", "x11")
 
 import numpy as np
 
@@ -29,6 +38,53 @@ import veyon_proto as vp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_ID = "dev.local.veyon-demo-viewer"
+
+
+class _XClientMessageEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int),
+                ("serial", ctypes.c_ulong),
+                ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p),
+                ("window", ctypes.c_ulong),
+                ("message_type", ctypes.c_ulong),
+                ("format", ctypes.c_int),
+                ("data", ctypes.c_long * 5)]
+
+
+def set_wm_state(xid, atom1, atom2=0):
+    """ClientMessage _NET_WM_STATE/ADD al WM (EWMH, X11 e XWayland)."""
+    lib = ctypes.CDLL("libX11.so.6")
+    lib.XOpenDisplay.restype = ctypes.c_void_p
+    lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    lib.XInternAtom.restype = ctypes.c_ulong
+    lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    lib.XDefaultRootWindow.restype = ctypes.c_ulong
+    lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    lib.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                               ctypes.c_long, ctypes.c_void_p]
+    lib.XFlush.argtypes = [ctypes.c_void_p]
+    lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    dpy = lib.XOpenDisplay(None)
+    if not dpy:
+        raise RuntimeError("XOpenDisplay fallita")
+    dpy = ctypes.c_void_p(dpy)
+    intern = lambda s: lib.XInternAtom(dpy, s.encode(), 0)
+    ev = _XClientMessageEvent()
+    ev.type = 33                             # ClientMessage
+    ev.send_event = 1
+    ev.display = dpy.value
+    ev.window = xid
+    ev.message_type = intern("_NET_WM_STATE")
+    ev.format = 32
+    ev.data[0] = 1                           # _NET_WM_STATE_ADD
+    ev.data[1] = intern(atom1)
+    ev.data[2] = intern(atom2) if atom2 else 0
+    ev.data[3] = 1                           # sorgente: applicazione
+    substructure = (1 << 19) | (1 << 20)     # Notify|Redirect mask
+    lib.XSendEvent(dpy, lib.XDefaultRootWindow(dpy), 0,
+                   substructure, ctypes.byref(ev))
+    lib.XFlush(dpy)
+    lib.XCloseDisplay(dpy)
 
 
 def install_icon():
@@ -456,6 +512,20 @@ class DemoApp(Gtk.Application):
         self.win.add_controller(keys)
 
         self.win.present()
+        GLib.idle_add(self._apply_wm_state)
+
+    def _apply_wm_state(self):
+        """PiP: sempre sopra le altre finestre e su tutti i desktop."""
+        surface = self.win.get_surface()
+        if surface is None:
+            return True                      # non ancora mappata: riprova
+        try:
+            set_wm_state(surface.get_xid(), "_NET_WM_STATE_ABOVE",
+                         "_NET_WM_STATE_STICKY")
+        except Exception as e:
+            print(f"  always-on-top non applicabile: {e!r}",
+                  file=sys.stderr, flush=True)
+        return False
 
     def _on_drag_begin(self, gesture, x, y):
         surface = self.win.get_surface()
