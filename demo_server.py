@@ -80,6 +80,7 @@ class DemoServer:
         self.on_status = on_status or (lambda t: log.info("%s", t))
         self.clients = 0
         self._lsock = None
+        self._socks = set()                 # socket dei client connessi
         self._stop = threading.Event()
         self._thread = None
 
@@ -101,6 +102,26 @@ class DemoServer:
             except OSError:
                 pass
             self._lsock = None
+        self.kick_all()
+
+    def kick_all(self):
+        """Disconnette tutti i client attualmente connessi."""
+        for cs in list(self._socks):
+            try:
+                cs.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                cs.close()
+            except OSError:
+                pass
+
+    def revoke(self):
+        """Termina la sessione: espelle i client e ruota il token, cosi'
+        nessuno puo' ricollegarsi con quello vecchio."""
+        self.kick_all()
+        self.token = new_token()
+        return self.token
 
     # -- server ------------------------------------------------------------
 
@@ -128,7 +149,8 @@ class DemoServer:
                 pass
 
     def _serve(self, cs, ip):
-        try:
+        self._socks.add(cs)          # tracciato subito: kick anche
+        try:                         # durante l'handshake
             cs.settimeout(30)
             cs.sendall(vp.RFB_VERSION)
             if not _recv(cs, 12).startswith(b"RFB 003."):
@@ -180,6 +202,7 @@ class DemoServer:
         except Exception:
             log.exception("demo client %s: errore", ip)
         finally:
+            self._socks.discard(cs)
             self.clients = max(0, self.clients - 1)
             try:
                 cs.close()

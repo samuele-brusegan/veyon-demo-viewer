@@ -754,6 +754,17 @@ class DemoApp(Adw.Application):
         self.demo_targets.clear()
         self._update_demo_state()
         self.log_line(f"stop demo → {stopped} client")
+        # se la sorgente e' il nostro demo server: espelli i client
+        # connessi e ruota il token, cosi' non possono ricollegarsi
+        if self.demo_server:
+            self.demo_server.revoke()
+            tok = self.demo_server.token.hex()
+            ip = local_ipv4() or "127.0.0.1"
+            self.rec_demo_row.set_subtitle(
+                f"in onda su {ip}:11400 — token {tok[:8]}…")
+            if f"{ip}:11400" in self.demo_src.get_text():
+                self.demo_src.set_text(f"{ip}:11400 {tok}")
+            self.log_line("demo server: client espulsi, token rinnovato")
 
     # ---- controllo remoto ----------------------------------------------------
 
