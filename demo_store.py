@@ -140,3 +140,44 @@ class Settings:
     def set_clients(self, ips):
         self.data["clients"] = ips
         self.save()
+
+
+CHAT_PATH = os.path.expanduser(
+    "~/.local/share/veyon-demo-viewer/chat.json")
+CHAT_MAX_PER_PEER = 200
+
+
+class ChatStore:
+    """Storico chat persistente: {ip: [{ts, who, text}]}.
+
+    'who' e' "io" per i messaggi inviati, altrimenti il nome del peer.
+    Condiviso tra GUI e daemon (il daemon salva i messaggi ricevuti
+    mentre la GUI e' chiusa)."""
+
+    def __init__(self, path=CHAT_PATH):
+        self.path = path
+        self.msgs = {}
+        try:
+            with open(path) as f:
+                self.msgs = json.load(f)
+        except Exception:
+            self.msgs = {}
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.msgs, f, indent=0)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log.warning("chat store: salvataggio fallito: %s", e)
+
+    def append(self, ip, who, text):
+        lst = self.msgs.setdefault(ip, [])
+        lst.append({"ts": time.time(), "who": who, "text": text})
+        del lst[:-CHAT_MAX_PER_PEER]
+        self.save()
+
+    def history(self, ip):
+        return list(self.msgs.get(ip, []))

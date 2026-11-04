@@ -58,6 +58,9 @@ class ScreenCapture:
         self._thread = None
         self._mctx = None
         self._pipe = None
+        self._conn = None          # connessione D-Bus di sessione
+        self._session = None       # object path portal Session
+        self._pwfd = None          # fd PipeWire remoto
 
     # -- API ------------------------------------------------------------
 
@@ -76,6 +79,11 @@ class ScreenCapture:
                 self._mctx.wakeup()       # sblocca iteration(True) in _run
             except Exception:
                 pass
+        t = self._thread
+        # join: la chiusura della sessione portal (indicatore GNOME)
+        # avviene nel finally di _run — aspetto che completi
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=5)
 
     def get_frame(self):
         return self.frame
@@ -114,6 +122,8 @@ class ScreenCapture:
             while not done.wait(0.05):
                 while ctx.iteration(False):
                     pass
+                if self._stop.is_set():
+                    raise RuntimeError("cattura annullata")
                 if time.monotonic() > deadline:
                     raise TimeoutError("portal: timeout attesa risposta")
         finally:
@@ -127,6 +137,7 @@ class ScreenCapture:
         """Sessione ScreenCast completa: ritorna (fd_pipewire, node_id)."""
         from gi.repository import Gio, GLib
         conn = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self._conn = conn
 
         def call(method, iface, params, sig):
             conn.call_sync(_PORTAL, _PORTAL_OBJ, iface,
@@ -139,6 +150,7 @@ class ScreenCapture:
             lambda p: call("CreateSession", _SCIFACE, (p,), "(a{sv})"),
             {"session_handle_token": GLib.Variant("s", sess_tok)})
         session = str(res["session_handle"])
+        self._session = session
 
         opts = {"types": GLib.Variant("u", 1),          # monitor
                 "multiple": GLib.Variant("b", False),
@@ -172,7 +184,8 @@ class ScreenCapture:
             GLib.VariantType.new("(h)"),
             Gio.DBusCallFlags.NONE, 15000, None, None)
         (fd_idx,) = result.unpack()
-        return fd_list.get(fd_idx), node
+        self._pwfd = fd_list.get(fd_idx)
+        return self._pwfd, node
 
     # -- GStreamer ---------------------------------------------------------
 
@@ -232,4 +245,30 @@ class ScreenCapture:
                 except Exception:
                     pass
                 self._pipe = None
+            # chiusura esplicita della sessione portal: senza questa
+            # GNOME continua a mostrare l'indicatore "registrazione
+            # schermo" nella barra superiore
+            if self._pwfd is not None:
+                try:
+                    os.close(self._pwfd)
+                except OSError:
+                    pass
+                self._pwfd = None
+            if self._session and self._conn:
+                try:
+                    from gi.repository import Gio, GLib
+                    self._conn.call_sync(
+                        _PORTAL, self._session,
+                        "org.freedesktop.portal.Session", "Close",
+                        None, None, Gio.DBusCallFlags.NONE, 5000, None)
+                except Exception as e:
+                    log.debug("chiusura sessione portal: %s", e)
+            self._session = None
+            self._conn = None
             self.frame = None
+            if self._mctx:
+                try:
+                    self._mctx.pop_thread_default()
+                except Exception:
+                    pass
+                self._mctx = None

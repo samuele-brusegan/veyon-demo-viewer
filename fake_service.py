@@ -142,6 +142,7 @@ class FakeServiceConnection:
         await self.send_async_feature_messages()
         self.username = username
         self.ctx.masters[self.peer[0]] = username
+        self.ctx.conns[self.peer[0]] = self
         self.ctx.push("conn", {"ip": self.peer[0], "user": username})
         self.say(f"{self.peer[0]} ora mi vede come un client Veyon online")
 
@@ -162,7 +163,24 @@ class FakeServiceConnection:
         if reply is not None:
             await self.send(reply)
 
-        if fm.uid in vp.DEMO_UIDS:
+        if fm.uid == vp.UID_CHAT:
+            if fm.command == vp.CMD_CHAT_PONG:
+                # il master e' un nostro client custom: registra versione
+                ver = str(fm.args.get(vp.ARG_IDENT_VER) or "")
+                self.ctx.master_ident[self.peer[0]] = ver
+                self.ctx.push("ident", {"ip": self.peer[0],
+                                        "custom": True, "version": ver})
+            elif fm.command in (vp.CMD_CHAT_SHARE_ON,
+                                vp.CMD_CHAT_SHARE_OFF):
+                on = fm.command == vp.CMD_CHAT_SHARE_ON
+                self.ctx.share_req = on
+                self.ctx.push("share_req", {"ip": self.peer[0], "on": on})
+            elif fm.command == vp.CMD_CHAT_MSG:
+                self.ctx.push("chat", {
+                    "ip": self.peer[0],
+                    "from": str(fm.args.get(vp.ARG_CHAT_FROM) or ""),
+                    "text": str(fm.args.get(vp.ARG_CHAT_TEXT) or "")})
+        elif fm.uid in vp.DEMO_UIDS:
             pass                      # narrato da veyondemo (che lancia il viewer)
         elif fm.uid == vp.UID_MONITORING and fm.command == 0:
             pass                      # keepalive, troppo frequente per narrarlo
@@ -178,6 +196,15 @@ class FakeServiceConnection:
 
     def feature_reply(self, fm):
         """Risposte alle feature builtin, come farebbe il vero servizio."""
+        if fm.uid == vp.UID_CHAT and fm.command == vp.CMD_CHAT_PING:
+            # ident custom: riveliamo nome+versione solo a chi conosce
+            # il nostro UID — un master Veyon reale non lo manda mai
+            return vp.FeatureMessage(
+                vp.UID_CHAT, vp.CMD_CHAT_PONG,
+                {vp.ARG_IDENT_NAME: vp.APP_NAME,
+                 vp.ARG_IDENT_VER: vp.APP_VERSION,
+                 vp.ARG_IDENT_SHARE:
+                     1 if self.ctx.sharing else 0}).serialize_rfb()
         if fm.uid == vp.UID_MONITORING:
             # Ping: il vero servizio risponde con lo stesso messaggio
             return fm.serialize_rfb()
@@ -227,6 +254,10 @@ class FakeServiceConnection:
         await self.send(self.user_info_msg())
         await self.send(self.session_info_msg())
         await self.send(self.screens_msg())
+        # ident ping: se il master e' un nostro client custom risponde
+        # PONG e lo marchiamo; un master reale ignora l'UID
+        await self.send(vp.FeatureMessage(
+            vp.UID_CHAT, vp.CMD_CHAT_PING, {}).serialize_rfb())
 
     async def handle_fbur(self, msg):
         incremental, x, y, w, h = struct.unpack(">BHHHH", msg)
@@ -297,6 +328,8 @@ async def handle_client(reader, writer, ctx):
         log.exception("[%s] errore", conn.peer[0])
     finally:
         ip = conn.peer[0]
+        ctx.conns.pop(ip, None)
+        ctx.master_ident.pop(ip, None)
         if ctx.masters.pop(ip, None) is not None:
             ctx.push("disc", {"ip": ip})
         try:
@@ -316,8 +349,13 @@ class ServiceCtx:
         self.username = getpass.getuser()
         self.hostname = socket.gethostname()
         self.masters = {}                    # ip -> username dei master online
+        self.master_ident = {}               # ip -> versione (custom client)
+        self.conns = {}                      # ip -> FakeServiceConnection
+        self.loop = None                     # asyncio loop (send asincrono)
         self.bridge = None                   # queue.Queue opzionale -> GUI
         self.frame_provider = None           # callable -> np RGB o None
+        self.sharing = False                 # stato condivisione (per il pong)
+        self.share_req = False               # richiesta remota di condivisione
         import time
         self._t0 = time.monotonic()
         self.public_key_pem = self._make_public_key()
@@ -326,6 +364,17 @@ class ServiceCtx:
         """Evento strutturato verso un consumatore esterno (es. la GUI)."""
         if self.bridge is not None:
             self.bridge.put((kind, payload))
+
+    def send_chat(self, ip, fm):
+        """Invia un FeatureMessage a un master connesso (thread-safe:
+        schedulato sul loop asyncio del service). Ritorna True se il
+        peer era connesso."""
+        conn = self.conns.get(ip)
+        if conn is None or self.loop is None:
+            return False
+        asyncio.run_coroutine_threadsafe(
+            conn.send(fm.serialize_rfb()), self.loop)
+        return True
 
     def uptime(self):
         import time
@@ -346,6 +395,7 @@ class ServiceCtx:
 
 
 async def run_service(port, ctx):
+    ctx.loop = asyncio.get_running_loop()
     server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, ctx), "0.0.0.0", port)
     log.info("fake veyon-service in ascolto su :%d", port)

@@ -82,16 +82,23 @@ class ClientService(threading.Thread):
     GLib.idle_add lato GUI).
     """
 
-    def __init__(self, ip, creds, on_status, on_frame, port=11100):
+    def __init__(self, ip, creds, on_status, on_frame, on_chat=None,
+                 on_ident=None, port=11100):
         super().__init__(daemon=True, name=f"master-{ip}")
         self.ip = ip
         self.port = port
         self.creds = creds
         self.on_status = on_status
         self.on_frame = on_frame
+        self.on_chat = on_chat          # (ip, nome, testo) o None
+        self.on_ident = on_ident        # (ip, info|None) o None
+        self.on_share = None            # (ip, accepted: bool) — risposta share
         self.fb = None
         self.sock = None
         self.stop_flag = False
+        self.ident_info = None               # dict {name, ver} se custom
+        self._ident_gen = 0             # invalida timer di connessioni vecchie
+        self.share_state = lambda: False    # -> bool, per il nostro pong
 
     # ---- handshake ---------------------------------------------------------
 
@@ -146,6 +153,14 @@ class ClientService(threading.Thread):
         (res,) = struct.unpack(">I", recv_exactly(s, 4))
         if res != vp.AUTH_OK:
             raise RuntimeError(f"auth fallita (result={res})")
+
+        # euristica ident: un Veyon reale verificherebbe la firma con
+        # una chiave registrata — se ha accettato la nostra chiave
+        # effimera e' quasi certamente un nostro client custom
+        if at == vp.AUTH_KEYFILE and not self.creds.key_file:
+            self.ident_info = {"name": vp.APP_NAME, "ver": "?"}
+            if self.on_ident:
+                self.on_ident(self.ip, self.ident_info)
 
         s.sendall(b"\x01")                         # ClientInit
         init = recv_exactly(s, 24)
@@ -225,7 +240,38 @@ class ClientService(threading.Thread):
                 new[:oh, :ow] = self.fb[:oh, :ow]
                 self.fb = new
             elif mtype == vp.MSG_FEATURE:
-                recv_vam(s)
+                payload = recv_vam(s)
+                try:
+                    fm = vp.FeatureMessage.parse(payload)
+                except Exception:
+                    continue
+                if fm.uid != vp.UID_CHAT:
+                    continue
+                if fm.command == vp.CMD_CHAT_MSG and self.on_chat:
+                    self.on_chat(
+                        self.ip,
+                        str(fm.args.get(vp.ARG_CHAT_FROM) or ""),
+                        str(fm.args.get(vp.ARG_CHAT_TEXT) or ""))
+                elif fm.command == vp.CMD_CHAT_PING:
+                    # il service remoto ci chiede l'identita'
+                    self.send_feature(vp.FeatureMessage(
+                        vp.UID_CHAT, vp.CMD_CHAT_PONG,
+                        {vp.ARG_IDENT_NAME: vp.APP_NAME,
+                         vp.ARG_IDENT_VER: vp.APP_VERSION,
+                         vp.ARG_IDENT_SHARE:
+                             1 if self.share_state() else 0}))
+                elif fm.command == vp.CMD_CHAT_SHARE_REPLY:
+                    if self.on_share:
+                        self.on_share(self.ip, bool(int(
+                            fm.args.get(vp.ARG_SHARE_ACCEPTED) or 0)))
+                elif fm.command == vp.CMD_CHAT_PONG:
+                    self.ident_info = {
+                        "name": str(fm.args.get(vp.ARG_IDENT_NAME) or "?"),
+                        "ver": str(fm.args.get(vp.ARG_IDENT_VER) or "?"),
+                        "share": bool(int(
+                            fm.args.get(vp.ARG_IDENT_SHARE) or 0))}
+                    if self.on_ident:
+                        self.on_ident(self.ip, self.ident_info)
             else:
                 raise RuntimeError(f"msg type {mtype} sconosciuto")
 
@@ -246,13 +292,25 @@ class ClientService(threading.Thread):
 
     # ---- main loop ----------------------------------------------------------
 
+    def _ident_timeout(self, gen):
+        if gen == self._ident_gen and self.ident_info is None and self.on_ident:
+            self.on_ident(self.ip, None)         # nessun pong: veyon reale
+
     def run(self):
         while not self.stop_flag:
+            self.ident_info = None
+            self._ident_gen += 1
+            gen = self._ident_gen
             try:
                 self.sock = socket.create_connection((self.ip, self.port), 5)
                 self.sock.settimeout(None)
                 self.handshake()
                 self.on_status(self.ip, "connesso")
+                # ident ping: pong atteso entro 3s, altrimenti "reale"
+                self.send_feature(vp.FeatureMessage(
+                    vp.UID_CHAT, vp.CMD_CHAT_PING, {}))
+                threading.Timer(3.0, self._ident_timeout,
+                                args=(gen,)).start()
                 self.serve()
             except Exception as e:
                 self.on_status(self.ip, f"errore: {e}")

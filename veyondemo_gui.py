@@ -28,7 +28,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
 import veyon_proto as vp
 from fake_service import ServiceCtx, run_service
 from demo_store import DemoStore, STORE_PATH, Settings, \
-    ip_net24, local_net24, local_ipv4
+    ChatStore, CHAT_PATH, ip_net24, local_net24, local_ipv4
 from master_client import ClientService, Credentials, scan_subnet, wol
 from screen_capture import ScreenCapture
 from demo_server import DemoServer, new_token
@@ -107,6 +107,18 @@ class Backend(threading.Thread):
     async def consume(self, events):
         while True:
             fm, peer = await events.get()
+            if fm.uid == vp.UID_CHAT:
+                if fm.command in (vp.CMD_CHAT_SHARE_ON,
+                                  vp.CMD_CHAT_SHARE_OFF):
+                    self.bridge.put(("share_req", {
+                        "ip": peer,
+                        "on": fm.command == vp.CMD_CHAT_SHARE_ON}))
+                elif fm.command == vp.CMD_CHAT_MSG:
+                    self.bridge.put(("chat", {
+                        "ip": peer,
+                        "from": str(fm.args.get(vp.ARG_CHAT_FROM) or ""),
+                        "text": str(fm.args.get(vp.ARG_CHAT_TEXT) or "")}))
+                continue
             if fm.uid not in vp.DEMO_UIDS:
                 continue
             if fm.command == vp.CMD_START_DEMO_CLIENT:
@@ -179,6 +191,11 @@ class DemoApp(Adw.Application):
         self.capture = None             # ScreenCapture condiviso
         self.demo_server = None         # DemoServer (produzione)
         self.demo_token = None
+        self._sw_guard = False          # sync switch senza ricorsione
+        self.chat_store = ChatStore(CHAT_PATH)
+        self.chat_wins = {}             # ip -> widget chat
+        self.client_kind = {}           # ip -> {"name","ver"} | "veyon"
+        self.client_status_txt = {}     # ip -> ultimo stato connessione
 
     # ---- costruzione UI ------------------------------------------------------
 
@@ -240,12 +257,26 @@ class DemoApp(Adw.Application):
         self.svc_lbl.add_css_class("dim-label")
         self.svc_lbl.set_valign(Gtk.Align.CENTER)
         self.svc_row.add_suffix(self.svc_lbl)
+        # icona demonietto: verde = nostro daemon attivo,
+        # rossa = porta occupata da un processo estraneo
+        self.demon_img = Gtk.Image.new_from_file(
+            os.path.join(HERE, "assets", "demon-green.svg"))
+        self.demon_img.set_pixel_size(30)
+        self.demon_img.set_valign(Gtk.Align.CENTER)
+        self.demon_img.set_visible(False)
+        self.svc_row.add_suffix(self.demon_img)
         grp.add(self.svc_row)
 
         self.masters_row = Adw.ActionRow(
             title="Master connessi", subtitle="nessuno")
         self.masters_row.add_prefix(Gtk.Image.new_from_icon_name(
             "system-users-symbolic"))
+        mchat = Gtk.Button(icon_name="user-available-symbolic",
+                           valign=Gtk.Align.CENTER)
+        mchat.add_css_class("flat")
+        mchat.set_tooltip_text("apri chat col master")
+        mchat.connect("clicked", lambda *_: self._open_master_chat())
+        self.masters_row.add_suffix(mchat)
         grp.add(self.masters_row)
 
         self.daemon_row = Adw.ActionRow(
@@ -441,13 +472,31 @@ class DemoApp(Adw.Application):
         self.clients_grp.add(self.empty_clients_row)
         content.append(self.clients_grp)
 
-        demo_grp = Adw.PreferencesGroup(title="Demo multicast")
+        demo_grp = Adw.PreferencesGroup(
+            title="Trasmetti demo",
+            description="1 · attiva «Il mio schermo» (o inserisci "
+                        "un'altra sorgente)   2 · spunta i client   "
+                        "3 · premi Invia")
+        self.demo_self_row = Adw.ActionRow(
+            title="Il mio schermo",
+            subtitle="demo server su :11400 — OFF")
+        self.demo_self_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "media-record-symbolic"))
+        self.demo_self_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.demo_self_sw.set_active(
+            bool(self.settings.get("record_demo")))
+        self.demo_self_sw.connect("notify::active",
+                                  self._on_record_demo_sw)
+        self.demo_self_row.add_suffix(self.demo_self_sw)
+        self.demo_self_row.set_activatable_widget(self.demo_self_sw)
+        demo_grp.add(self.demo_self_row)
         self.demo_src = Adw.EntryRow(
-            title="Sorgente manuale (host:porta [token-hex])")
+            title="Altra sorgente (host:porta [token-hex])")
         demo_grp.add(self.demo_src)
         row = Adw.ActionRow(
             title="Invia demo ai selezionati",
-            subtitle="sorgente manuale, altrimenti l'ultima demo attiva")
+            subtitle="«Il mio schermo», la sorgente indicata o "
+                     "l'ultima demo attiva catturata")
         row.add_prefix(Gtk.Image.new_from_icon_name(
             "media-playback-start-symbolic"))
         send = Gtk.Button(label="Invia", valign=Gtk.Align.CENTER)
@@ -556,8 +605,20 @@ class DemoApp(Adw.Application):
     # ---- registrazione schermo ----------------------------------------------
 
     def _on_record_demo_sw(self, sw, _pspec):
+        if self._sw_guard:
+            return
         self.settings.set("record_demo", sw.get_active())
         self._apply_record_demo()
+
+    def _sync_record_demo_switches(self, on):
+        self._sw_guard = True
+        try:
+            for s in (getattr(self, "rec_demo_sw", None),
+                      getattr(self, "demo_self_sw", None)):
+                if s is not None and s.get_active() != on:
+                    s.set_active(on)
+        finally:
+            self._sw_guard = False
 
     def _on_record_master_sw(self, sw, _pspec):
         self.settings.set("record_master", sw.get_active())
@@ -588,7 +649,10 @@ class DemoApp(Adw.Application):
         return None
 
     def _apply_record_master(self):
-        if self.settings.get("record_master"):
+        on = bool(self.settings.get("record_master"))
+        if self.backend and self.backend.ctx:
+            self.backend.ctx.sharing = on        # riportato nel pong ident
+        if on:
             self._ensure_capture()
             self.rec_master_row.set_subtitle(
                 "schermo visibile ai master connessi — ON")
@@ -598,7 +662,9 @@ class DemoApp(Adw.Application):
         self._maybe_stop_capture()
 
     def _apply_record_demo(self):
-        if self.settings.get("record_demo"):
+        on = bool(self.settings.get("record_demo"))
+        self._sync_record_demo_switches(on)
+        if on:
             self._ensure_capture()
             if self.demo_server is None:
                 self.demo_token = new_token()
@@ -607,8 +673,10 @@ class DemoApp(Adw.Application):
                     on_status=self._cap_status)
                 self.demo_server.start()
             ip = local_ipv4() or "127.0.0.1"
-            self.rec_demo_row.set_subtitle(
-                f"in onda su {ip}:11400 — token {self.demo_token.hex()[:8]}…")
+            sub = (f"in onda su {ip}:11400 — "
+                   f"token {self.demo_token.hex()[:8]}…")
+            self.rec_demo_row.set_subtitle(sub)
+            self.demo_self_row.set_subtitle(sub)
             if not self.demo_src.get_text().strip():
                 self.demo_src.set_text(
                     f"{ip}:11400 {self.demo_token.hex()}")
@@ -620,6 +688,10 @@ class DemoApp(Adw.Application):
                 self.demo_token = None
             self.rec_demo_row.set_subtitle(
                 "demo server su :11400 col tuo schermo — OFF")
+            self.demo_self_row.set_subtitle(
+                "demo server su :11400 — OFF")
+            if f"{local_ipv4()}:11400" in self.demo_src.get_text():
+                self.demo_src.set_text("")
         self._maybe_stop_capture()
 
     # ---- azioni sui client --------------------------------------------------
@@ -627,7 +699,9 @@ class DemoApp(Adw.Application):
     def _client_action(self, param):
         act, ip = param.split("|", 1)
         svc = self.client_svcs.get(ip)
-        if act == "shot":
+        if act == "chat":
+            self._open_chat(ip)
+        elif act == "shot":
             self._save_shot(ip, svc.fb if svc else None)
         elif act == "msg":
             self._ask_text(ip, "Messaggio", "Invia", self._send_msg)
@@ -645,6 +719,13 @@ class DemoApp(Adw.Application):
         elif act == "wol":
             self._ask_text(ip, "MAC address (AA:BB:CC:DD:EE:FF)", "WoL",
                            self._send_wol)
+        elif act in ("share_on", "share_off"):
+            cmd = (vp.CMD_CHAT_SHARE_ON if act == "share_on"
+                   else vp.CMD_CHAT_SHARE_OFF)
+            if svc:
+                svc.send_feature(vp.FeatureMessage(vp.UID_CHAT, cmd, {}))
+            self.log_line(f"richiesta condivisione schermo "
+                          f"{'ON' if act == 'share_on' else 'OFF'} → {ip}")
         elif act == "control":
             self._open_control(ip)
 
@@ -698,6 +779,185 @@ class DemoApp(Adw.Application):
         except Exception as e:
             self.log_line(f"WoL fallito: {e}")
 
+    # ---- chat custom ---------------------------------------------------------
+
+    def _chat_name(self):
+        import getpass
+        import socket as _s
+        return f"{self.creds.username or getpass.getuser()}@{_s.gethostname()}"
+
+    def _chat_ui(self, ip):
+        """Finestra chat del peer: la crea (senza presentarla) e
+        carica lo storico."""
+        w = self.chat_wins.get(ip)
+        if w is not None:
+            return w
+        win = Gtk.Window(title=f"Chat — {ip}", transient_for=self.win,
+                         default_width=420, default_height=340)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(10)
+        scrolled = Gtk.ScrolledWindow(vexpand=True)
+        msgs = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scrolled.set_child(msgs)
+        entry = Gtk.Entry(placeholder_text="Scrivi un messaggio…")
+        entry.connect("activate", lambda *_: self._chat_send(ip))
+        box.append(scrolled)
+        box.append(entry)
+        win.set_child(box)
+        win.connect("close-request", self._chat_closed, ip)
+        w = {"win": win, "msgs": msgs, "entry": entry,
+             "scrolled": scrolled}
+        self.chat_wins[ip] = w
+        for m in self.chat_store.history(ip):
+            self._chat_add(ip, m["who"], m["text"], m.get("ts"))
+        return w
+
+    def _chat_closed(self, win, ip):
+        if self.chat_wins.get(ip, {}).get("win") is win:
+            del self.chat_wins[ip]
+        return False
+
+    def _chat_add(self, ip, who, text, ts=None):
+        w = self._chat_ui(ip)
+        when = time.strftime("%H:%M", time.localtime(ts or time.time()))
+        mine = who == "io"
+        lbl = Gtk.Label(label=f"{when}  {who}: {text}", wrap=True,
+                        xalign=1.0 if mine else 0.0,
+                        halign=Gtk.Align.END if mine else Gtk.Align.START,
+                        selectable=True)
+        if mine:
+            lbl.add_css_class("dim-label")
+        w["msgs"].append(lbl)
+        GLib.idle_add(self._chat_scroll, w)
+
+    def _chat_scroll(self, w):
+        adj = w["scrolled"].get_vadjustment()
+        adj.set_value(adj.get_upper() - adj.get_page_size())
+        return False
+
+    def _open_chat(self, ip):
+        self._chat_ui(ip)["win"].present()
+
+    def _open_master_chat(self):
+        ctx = self.backend.ctx if self.backend else None
+        ips = sorted((ctx.masters if ctx else {}).keys())
+        if not ips:
+            self.log_line("chat: nessun master connesso")
+            return
+        if len(ips) == 1:
+            self._open_chat(ips[0])
+            return
+        # piu' master: piccola selezione
+        dlg = Adw.Dialog(title="Chat con…", content_width=320)
+        tvw = Adw.ToolbarView()
+        tvw.add_top_bar(Adw.HeaderBar())
+        lb = Gtk.ListBox()
+        lb.add_css_class("boxed-list")
+        for m in ("top", "bottom", "start", "end"):
+            getattr(lb, f"set_margin_{m}")(12)
+        for ip in ips:
+            lb.append(Adw.ActionRow(
+                title=f"{ctx.masters.get(ip) or '?'} ({ip})"))
+        lb.connect("row-activated",
+                   lambda _l, r: (self._open_chat(ips[r.get_index()]),
+                                  dlg.close()))
+        tvw.set_content(lb)
+        dlg.set_child(tvw)
+        dlg.present(self.win)
+
+    def _chat_send(self, ip):
+        w = self.chat_wins.get(ip)
+        if not w:
+            return
+        text = w["entry"].get_text().strip()
+        if not text:
+            return
+        fm = vp.FeatureMessage(vp.UID_CHAT, vp.CMD_CHAT_MSG, {
+            vp.ARG_CHAT_FROM: self._chat_name(),
+            vp.ARG_CHAT_TEXT: text})
+        sent = False
+        svc = self.client_svcs.get(ip)
+        if svc and svc.sock:
+            svc.send_feature(fm)                    # connessione in uscita
+            sent = True
+        else:
+            ctx = self.backend.ctx if self.backend else None
+            if ctx and ctx.send_chat(ip, fm):       # master connesso a noi
+                sent = True
+        if sent:
+            w["entry"].set_text("")
+            self._chat_add(ip, "io", text)
+            self.chat_store.append(ip, "io", text)
+        else:
+            self.log_line(f"chat: {ip} non raggiungibile")
+
+    def _send_share_reply(self, ip, accepted):
+        fm = vp.FeatureMessage(vp.UID_CHAT, vp.CMD_CHAT_SHARE_REPLY,
+                               {vp.ARG_SHARE_ACCEPTED: 1 if accepted else 0})
+        ctx = self.backend.ctx if self.backend else None
+        if ctx:
+            ctx.send_chat(ip, fm)
+        svc = self.client_svcs.get(ip)
+        if svc and svc.sock:
+            svc.send_feature(fm)
+
+    def _ask_share_consent(self, ip):
+        self.log_line(f"{ip} chiede di vedere il tuo schermo")
+        dlg = Adw.AlertDialog(
+            heading="Condivisione schermo",
+            body=f"Un client custom ({ip}) chiede di vedere il tuo "
+                 "schermo. Se accetti, i master connessi riceveranno "
+                 "i frame reali invece del framebuffer nero.")
+        dlg.add_response("no", "Rifiuta")
+        dlg.add_response("yes", "Consenti")
+        dlg.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_close_response("no")
+        state = {"answered": False}
+
+        def on_resp(_d, resp):
+            if state["answered"]:
+                return
+            state["answered"] = True
+            ok = resp == "yes"
+            if ok:
+                self.rec_master_sw.set_active(True)
+            self._send_share_reply(ip, ok)
+            self.log_line(f"condivisione con {ip} "
+                          + ("accettata" if ok else "rifiutata"))
+        dlg.connect("response", on_resp)
+        # auto-rifiuto dopo 30s senza risposta
+        GLib.timeout_add_seconds(
+            30, lambda: (not state["answered"]) and dlg.close())
+        dlg.present(self.win)
+
+    def _client_share(self, ip, accepted):
+        GLib.idle_add(self._on_share_reply, ip, accepted)
+
+    def _on_share_reply(self, ip, accepted):
+        self.log_line(f"condivisione {'accettata' if accepted else 'rifiutata'} "
+                      f"da {ip}")
+        kind = self.client_kind.get(ip)
+        if isinstance(kind, dict):
+            kind["share"] = accepted
+            self._refresh_client_sub(ip)
+        return False
+
+    def _client_chat(self, ip, name, text):
+        GLib.idle_add(self._on_chat_in, ip, name, text)
+
+    def _on_chat_in(self, ip, name, text):
+        if not text:
+            return False
+        who = name or ip
+        self.chat_store.append(ip, who, text)
+        had_win = ip in self.chat_wins
+        self._chat_add(ip, who, text)
+        if not had_win:
+            self._open_chat(ip)                     # mostra al primo messaggio
+        self.log_line(f"chat da {who} ({ip}): {text}")
+        return False
+
     # ---- demo multicast -----------------------------------------------------
 
     def _on_send_demo(self, *_):
@@ -718,13 +978,19 @@ class DemoApp(Adw.Application):
                               "(formato host:porta [token-hex])")
                 return
         else:
-            rec = next((r for r in self.store.sorted()
-                        if r.get("active") and self._rec_visible(r)), None)
+            if self.demo_server:
+                rec = {"host": local_ipv4() or "127.0.0.1", "port": 11400,
+                       "token": self.demo_server.token.hex(),
+                       "mode": "window"}
+            else:
+                rec = next((r for r in self.store.sorted()
+                            if r.get("active") and self._rec_visible(r)),
+                           None)
         if not targets:
             self.log_line("demo: nessun client selezionato")
         elif rec is None:
-            self.log_line("demo: nessuna demo attiva da inoltrare — "
-                          "usa la sorgente manuale")
+            self.log_line("demo: nessuna sorgente — attiva «Il mio "
+                          "schermo» o inserisci una sorgente")
         else:
             uid = (vp.DEMO_UID_FULLSCREEN if rec["mode"] == "fullscreen"
                    else vp.DEMO_UID_WINDOW)
@@ -776,8 +1042,9 @@ class DemoApp(Adw.Application):
             self.demo_server.revoke()
             tok = self.demo_server.token.hex()
             ip = local_ipv4() or "127.0.0.1"
-            self.rec_demo_row.set_subtitle(
-                f"in onda su {ip}:11400 — token {tok[:8]}…")
+            sub = f"in onda su {ip}:11400 — token {tok[:8]}…"
+            self.rec_demo_row.set_subtitle(sub)
+            self.demo_self_row.set_subtitle(sub)
             if f"{ip}:11400" in self.demo_src.get_text():
                 self.demo_src.set_text(f"{ip}:11400 {tok}")
             self.log_line("demo server: client espulsi, token rinnovato")
@@ -938,13 +1205,16 @@ class DemoApp(Adw.Application):
         chk.set_tooltip_text("seleziona per demo multicast")
         row.add_suffix(chk)
         menu = Gio.Menu()
-        for label, act in (("Screenshot", "shot"),
+        for label, act in (("Chat", "chat"),
+                           ("Screenshot", "shot"),
                            ("Messaggio…", "msg"),
                            ("Blocca schermo", "lock"),
                            ("Sblocca", "unlock"),
                            ("Riavvia", "reboot"),
                            ("Spegni", "powerdown"),
                            ("Wake-on-LAN…", "wol"),
+                           ("Richiedi condivisione schermo", "share_on"),
+                           ("Interrompi condivisione", "share_off"),
                            ("Controllo remoto", "control")):
             it = Gio.MenuItem.new(label, "app.client")
             it.set_attribute_value(
@@ -969,6 +1239,8 @@ class DemoApp(Adw.Application):
         svc = self.client_svcs.pop(ip, None)
         if svc:
             svc.stop_flag = True
+        self.client_kind.pop(ip, None)
+        self.client_status_txt.pop(ip, None)
         row = self.client_rows.pop(ip, None)
         if row:
             self.clients_grp.remove(row[0])
@@ -985,7 +1257,12 @@ class DemoApp(Adw.Application):
             old.stop_flag = True
         svc = ClientService(ip, self.creds,
                             on_status=self._client_status,
-                            on_frame=self._client_frame)
+                            on_frame=self._client_frame,
+                            on_chat=self._client_chat,
+                            on_ident=self._client_ident)
+        svc.share_state = (
+            lambda: bool(self.settings.get("record_master")))
+        svc.on_share = self._client_share
         self.client_svcs[ip] = svc
         svc.start()
 
@@ -993,8 +1270,37 @@ class DemoApp(Adw.Application):
         GLib.idle_add(self._set_client_status, ip, text)
 
     def _set_client_status(self, ip, text):
-        if ip in self.client_rows:
-            self.client_rows[ip][0].set_subtitle(text)
+        self.client_status_txt[ip] = text
+        self._refresh_client_sub(ip)
+
+    def _refresh_client_sub(self, ip):
+        if ip not in self.client_rows:
+            return
+        text = self.client_status_txt.get(ip, "")
+        kind = self.client_kind.get(ip)
+        if isinstance(kind, dict):
+            text += f" — client custom v{kind.get('ver') or '?'}"
+            if kind.get("share"):
+                text += " ·condivide lo schermo"
+        elif kind == "veyon":
+            text += " — veyon reale"
+        self.client_rows[ip][0].set_subtitle(text)
+
+    def _client_ident(self, ip, info):
+        GLib.idle_add(self._on_ident, ip, info)
+
+    def _on_ident(self, ip, info):
+        prev = self.client_kind.get(ip)
+        self.client_kind[ip] = info if info is not None else "veyon"
+        self._refresh_client_sub(ip)
+        if prev != self.client_kind[ip]:
+            if info is not None:
+                self.log_line(f"{ip}: client custom rilevato "
+                              f"(v{info.get('ver') or '?'})")
+            else:
+                self.log_line(f"{ip}: nessun pong ident — "
+                              "veyon reale o versione troppo vecchia")
+        return False
 
     def _client_frame(self, ip, fb):
         now = time.monotonic()
@@ -1172,6 +1478,8 @@ class DemoApp(Adw.Application):
             line = payload["line"]
             if " in ascolto su :" in line:
                 self.svc_lbl.set_text("attivo")
+                self.svc_lbl.set_visible(True)
+                self.demon_img.set_visible(False)
                 self.svc_lbl.remove_css_class("dim-label")
                 self.svc_lbl.add_css_class("success")
                 self.status_dot.add_css_class("success")
@@ -1197,10 +1505,35 @@ class DemoApp(Adw.Application):
             self.kill_viewer()
             for rec in self.store.sorted():
                 self.add_row(rec)
+        elif kind == "chat":
+            self._on_chat_in(payload["ip"], payload.get("from", ""),
+                             payload.get("text", ""))
+        elif kind == "share_req":
+            ip, on = payload["ip"], payload["on"]
+            if not on:
+                # revoca: immediata, nessun consenso necessario
+                if self.rec_master_sw.get_active():
+                    self.rec_master_sw.set_active(False)
+                self.log_line(f"{ip} ha fermato la condivisione schermo")
+            elif self.rec_master_sw.get_active():
+                self._send_share_reply(ip, True)   # gia' condiviso
+            else:
+                self._ask_share_consent(ip)
+        elif kind == "ident":
+            self._refresh_masters()
+            self.log_line(f"master {payload['ip']} è un client custom "
+                          f"v{payload.get('version') or '?'}")
         elif kind == "fatal":
             err = payload["error"]
             if "98" in err and daemon_running():
-                self.svc_lbl.set_text("daemon attivo")
+                self.svc_lbl.set_visible(False)
+                self.demon_img.set_from_file(
+                    os.path.join(HERE, "assets", "demon-green.svg"))
+                self.demon_img.set_tooltip_text(
+                    "Daemon attivo su :" + str(self.args.port) +
+                    " — il nostro servizio in background cattura i "
+                    "token demo anche quando questa finestra è chiusa")
+                self.demon_img.set_visible(True)
                 self.svc_lbl.remove_css_class("dim-label")
                 self.svc_lbl.add_css_class("success")
                 self.status_dot.add_css_class("success")
@@ -1211,7 +1544,14 @@ class DemoApp(Adw.Application):
                 self.log_line(f":{self.args.port} occupata dal daemon — "
                               "seguo lo store condiviso")
             else:
-                self.svc_lbl.set_text("errore")
+                self.svc_lbl.set_visible(False)
+                self.demon_img.set_from_file(
+                    os.path.join(HERE, "assets", "demon-red.svg"))
+                self.demon_img.set_tooltip_text(
+                    f"Servizio non attivo: {err}" +
+                    (" — la porta è occupata da un altro processo"
+                     if "98" in err else ""))
+                self.demon_img.set_visible(True)
                 self.svc_lbl.add_css_class("error")
                 self.log_line(f"FATALE: {err}")
                 if "98" in err:
@@ -1221,7 +1561,11 @@ class DemoApp(Adw.Application):
     def _refresh_masters(self):
         ctx = self.backend.ctx if self.backend else None
         masters = ctx.masters if ctx else {}
-        txt = ("; ".join(f"{u or '?'} ({ip})" for ip, u in masters.items())
+        ident = ctx.master_ident if ctx else {}
+        txt = ("; ".join(
+                f"{u or '?'} ({ip})" +
+                (f" ·custom v{ident[ip]}" if ip in ident else "")
+                for ip, u in masters.items())
                if masters else "nessuno")
         self.masters_row.set_subtitle(txt)
 

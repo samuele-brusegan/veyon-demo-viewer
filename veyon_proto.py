@@ -113,6 +113,27 @@ ARG_DEMO_SERVER_HOST = "3"
 ARG_DEMO_SERVER_PORT = "4"
 ARG_VIEWPORT = "5"
 
+# chat custom (protocollo nostro, non fa parte di Veyon upstream):
+# FeatureMessage bidirezionale sul canale :11100 gia' esistente.
+# Funziona solo tra istanze di questa app — i veyon-service reali
+# ignorano UID sconosciuti.
+UID_CHAT = uuidlib.UUID("060ecafa-63f8-5c01-ad20-970f979ed30d")
+CMD_CHAT_MSG = 0
+CMD_CHAT_PING = 1            # richiesta identita' (custom client?)
+CMD_CHAT_PONG = 2            # risposta: args name+ver (+ share)
+CMD_CHAT_SHARE_ON = 3        # richiesta: servi il tuo schermo ai FBUR
+CMD_CHAT_SHARE_OFF = 4       # richiesta: smetti di condividere
+CMD_CHAT_SHARE_REPLY = 5     # risposta alla richiesta (accettato/rifiutato)
+ARG_SHARE_ACCEPTED = "5"     # nel reply: 1 accettato, 0 rifiutato
+ARG_CHAT_FROM = "0"
+ARG_CHAT_TEXT = "1"
+ARG_IDENT_NAME = "2"
+ARG_IDENT_VER = "3"
+ARG_IDENT_SHARE = "4"        # nel pong: 1 se sta condividendo lo schermo
+
+APP_NAME = "veyon-demo-viewer"
+APP_VERSION = "1.6"
+
 CHALLENGE_SIZE = 128
 
 # ---------------------------------------------------------------------------

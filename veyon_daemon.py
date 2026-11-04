@@ -18,15 +18,35 @@ import os
 import veyon_proto as vp
 from fake_service import ServiceCtx, run_service
 from demo_store import DemoStore, STORE_PATH, Settings, SETTINGS_PATH, \
-    ip_net24
+    ChatStore, CHAT_PATH, ip_net24
 from screen_capture import ScreenCapture
 
 log = logging.getLogger("veyon_daemon")
 
 
-async def consume(events, store):
+async def consume(events, store, chats, ctx):
     while True:
         fm, peer = await events.get()
+        if fm.uid == vp.UID_CHAT and \
+                fm.command in (vp.CMD_CHAT_SHARE_ON, vp.CMD_CHAT_SHARE_OFF):
+            on = fm.command == vp.CMD_CHAT_SHARE_ON
+            ctx.share_req = on
+            # headless: nessun utente a cui chiedere — auto-accetta e
+            # risponde subito al richiedente
+            ctx.send_chat(peer, vp.FeatureMessage(
+                vp.UID_CHAT, vp.CMD_CHAT_SHARE_REPLY,
+                {vp.ARG_SHARE_ACCEPTED: 1}))
+            log.info("condivisione schermo %s su richiesta di %s "
+                     "(auto-accettata: daemon)",
+                     "attivata" if on else "fermata", peer)
+            continue
+        if fm.uid == vp.UID_CHAT:
+            who = str(fm.args.get(vp.ARG_CHAT_FROM) or peer)
+            text = str(fm.args.get(vp.ARG_CHAT_TEXT) or "")
+            if text:
+                chats.append(peer, who, text)
+                log.info("chat da %s (%s): %s", who, peer, text)
+            continue
         if fm.uid not in vp.DEMO_UIDS:
             continue
         if fm.command == vp.CMD_START_DEMO_CLIENT:
@@ -44,10 +64,12 @@ async def consume(events, store):
 
 
 async def watch_settings(ctx):
-    """Osserva settings.json: con 'record_master' attivo avvia la
-    cattura schermo e la serve ai FBUR dei master."""
+    """Osserva settings.json + richieste remote: con 'record_master'
+    attivo o share_req remoto avvia la cattura e la serve ai FBUR."""
     cap = None
     mtime = None
+    setting = False
+    last = None
     while True:
         try:
             mt = os.path.getmtime(SETTINGS_PATH)
@@ -55,30 +77,35 @@ async def watch_settings(ctx):
             mt = None
         if mt != mtime:
             mtime = mt
-            on = bool(Settings().get("record_master"))
-            if on and cap is None:
+            setting = bool(Settings().get("record_master"))
+        want = setting or ctx.share_req
+        ctx.sharing = want
+        if want != last:
+            last = want
+            if want and cap is None:
                 cap = ScreenCapture(
                     on_status=lambda t: log.info("schermo: %s", t))
                 cap.start()
                 ctx.frame_provider = cap.get_frame
-                log.info("record_master ON — schermo servito ai master")
-            elif not on and cap is not None:
+                log.info("condivisione ON — schermo servito ai master")
+            elif not want and cap is not None:
                 cap.stop()
                 cap = None
                 ctx.frame_provider = None
-                log.info("record_master OFF — framebuffer nero")
+                log.info("condivisione OFF — framebuffer nero")
         await asyncio.sleep(3)
 
 
 async def amain(args):
     store = DemoStore(STORE_PATH)
+    chats = ChatStore(CHAT_PATH)
     # allo start lo stato reale e' ignoto: niente demo marcata attiva;
     # se il master ri-annuncia una demo in corso torna attiva da sola
     store.deactivate()
     events = asyncio.Queue()
     ctx = ServiceCtx(events, verbose=args.verbose)
     await asyncio.gather(run_service(args.port, ctx),
-                         consume(events, store),
+                         consume(events, store, chats, ctx),
                          watch_settings(ctx))
 
 

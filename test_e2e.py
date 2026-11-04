@@ -155,8 +155,8 @@ async def mock_master(events):
     await reader.readexactly(name_len)
     check("master: ServerInit", len(init) == 24)
 
-    # async feature messages post-connect (user/session/screens)
-    for _ in range(3):
+    # async feature messages post-connect (user/session/screens/ident ping)
+    for _ in range(4):
         assert (await reader.readexactly(1))[0] == vp.MSG_FEATURE
         await read_vam_r(reader)
 
