@@ -1295,8 +1295,14 @@ class DemoApp(Adw.Application):
         self._refresh_client_sub(ip)
         if prev != self.client_kind[ip]:
             if info is not None:
-                self.log_line(f"{ip}: client custom rilevato "
-                              f"(v{info.get('ver') or '?'})")
+                if isinstance(prev, dict) and \
+                        prev.get("share") != info.get("share"):
+                    self.log_line(f"{ip} ha "
+                                  f"{'avviato' if info.get('share') else 'fermato'} "
+                                  "la condivisione schermo")
+                elif not isinstance(prev, dict):
+                    self.log_line(f"{ip}: client custom rilevato "
+                                  f"(v{info.get('ver') or '?'})")
             else:
                 self.log_line(f"{ip}: nessun pong ident — "
                               "veyon reale o versione troppo vecchia")

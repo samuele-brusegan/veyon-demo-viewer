@@ -198,13 +198,21 @@ class FakeServiceConnection:
         """Risposte alle feature builtin, come farebbe il vero servizio."""
         if fm.uid == vp.UID_CHAT and fm.command == vp.CMD_CHAT_PING:
             # ident custom: riveliamo nome+versione solo a chi conosce
-            # il nostro UID — un master Veyon reale non lo manda mai
+            # il nostro UID — un master Veyon reale non lo manda mai.
+            # share=1 solo se i frame fluiscono DAVVERO: se la cattura
+            # e' in attesa di consenso o in errore, rispondiamo 0 cosi'
+            # il master vede "non condivide" invece di uno schermo nero
+            share = 0
+            if self.ctx.frame_provider is not None:
+                try:
+                    share = 1 if self.ctx.frame_provider() is not None else 0
+                except Exception:
+                    share = 0
             return vp.FeatureMessage(
                 vp.UID_CHAT, vp.CMD_CHAT_PONG,
                 {vp.ARG_IDENT_NAME: vp.APP_NAME,
                  vp.ARG_IDENT_VER: vp.APP_VERSION,
-                 vp.ARG_IDENT_SHARE:
-                     1 if self.ctx.sharing else 0}).serialize_rfb()
+                 vp.ARG_IDENT_SHARE: share}).serialize_rfb()
         if fm.uid == vp.UID_MONITORING:
             # Ping: il vero servizio risponde con lo stesso messaggio
             return fm.serialize_rfb()

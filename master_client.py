@@ -296,6 +296,17 @@ class ClientService(threading.Thread):
         if gen == self._ident_gen and self.ident_info is None and self.on_ident:
             self.on_ident(self.ip, None)         # nessun pong: veyon reale
 
+    def _ident_poller(self, gen):
+        """Re-ping ogni 20s: tiene aggiornato versione/stato share."""
+        while (gen == self._ident_gen and not self.stop_flag
+               and self.sock is not None):
+            time.sleep(20)
+            try:
+                self.send_feature(vp.FeatureMessage(
+                    vp.UID_CHAT, vp.CMD_CHAT_PING, {}))
+            except OSError:
+                return
+
     def run(self):
         while not self.stop_flag:
             self.ident_info = None
@@ -311,6 +322,9 @@ class ClientService(threading.Thread):
                     vp.UID_CHAT, vp.CMD_CHAT_PING, {}))
                 threading.Timer(3.0, self._ident_timeout,
                                 args=(gen,)).start()
+                threading.Thread(target=self._ident_poller, args=(gen,),
+                                 daemon=True,
+                                 name=f"ident-poll-{self.ip}").start()
                 self.serve()
             except Exception as e:
                 self.on_status(self.ip, f"errore: {e}")

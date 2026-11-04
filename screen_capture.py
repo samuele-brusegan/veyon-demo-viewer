@@ -211,7 +211,135 @@ class ScreenCapture:
             return Gst.FlowReturn.ERROR
         return Gst.FlowReturn.OK
 
+    # ---- fallback X11 (XFCE/LXDE/ecc. — niente portale necessario) ----------
+
+    def _run_x11(self):
+        """Cattura via XGetImage sul root window (~3 fps).
+
+        Su X11 qualsiasi client della sessione puo' leggere il root
+        window: niente portale, niente consenso. Usato su sessioni
+        X11 (XFCE, LXDE...) dove il portale ScreenCast non esiste."""
+        import ctypes
+        import ctypes.util
+
+        class XImage(ctypes.Structure):
+            _fields_ = [("width", ctypes.c_int), ("height", ctypes.c_int),
+                        ("xoffset", ctypes.c_int), ("format", ctypes.c_int),
+                        ("data", ctypes.c_void_p),
+                        ("byte_order", ctypes.c_int),
+                        ("bitmap_unit", ctypes.c_int),
+                        ("bitmap_bit_order", ctypes.c_int),
+                        ("bitmap_pad", ctypes.c_int),
+                        ("depth", ctypes.c_int),
+                        ("bytes_per_line", ctypes.c_int),
+                        ("bits_per_pixel", ctypes.c_int),
+                        ("red_mask", ctypes.c_ulong),
+                        ("green_mask", ctypes.c_ulong),
+                        ("blue_mask", ctypes.c_ulong)]
+
+        class XWindowAttributes(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int),
+                        ("width", ctypes.c_int), ("height", ctypes.c_int),
+                        ("border_width", ctypes.c_int),
+                        ("depth", ctypes.c_int),
+                        ("visual", ctypes.c_void_p),
+                        ("root", ctypes.c_ulong),
+                        ("class_", ctypes.c_int),
+                        ("bit_gravity", ctypes.c_int),
+                        ("win_gravity", ctypes.c_int),
+                        ("backing_store", ctypes.c_int),
+                        ("backing_planes", ctypes.c_ulong),
+                        ("backing_pixel", ctypes.c_ulong),
+                        ("save_under", ctypes.c_int),
+                        ("colormap", ctypes.c_ulong),
+                        ("map_installed", ctypes.c_int),
+                        ("map_state", ctypes.c_int),
+                        ("all_event_masks", ctypes.c_long),
+                        ("your_event_mask", ctypes.c_long),
+                        ("do_not_propagate_mask", ctypes.c_long),
+                        ("override_redirect", ctypes.c_int),
+                        ("screen", ctypes.c_void_p)]
+
+        xlib = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        xlib.XOpenDisplay.restype = ctypes.c_void_p
+        xlib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        xlib.XDefaultRootWindow.restype = ctypes.c_ulong
+        xlib.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                   ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint, ctypes.c_uint,
+                                   ctypes.c_ulong, ctypes.c_int]
+        xlib.XGetImage.restype = ctypes.POINTER(XImage)
+        xlib.XFree.argtypes = [ctypes.c_void_p]
+        xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        xlib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        # gli errori X di default uccidono il processo: li trasformo in
+        # eccezioni gestibili (es. XGetImage su root di XWayland)
+        xerr = []
+        ERRHANDLER = ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _on_xerr(_d, ev):
+            xerr.append(ev)
+            return 0
+        handler = ERRHANDLER(_on_xerr)
+        xlib.XSetErrorHandler.argtypes = [ERRHANDLER]
+        xlib.XSetErrorHandler(handler)
+
+        dpy = xlib.XOpenDisplay(None)
+        if not dpy:
+            raise RuntimeError("X11: impossibile aprire DISPLAY")
+        try:
+            root = xlib.XDefaultRootWindow(dpy)
+            attr = XWindowAttributes()
+            xlib.XGetWindowAttributes(dpy, root, ctypes.byref(attr))
+            W, H = attr.width, attr.height
+            self.on_status(f"cattura X11 attiva ({W}x{H}) — nessun "
+                           "consenso necessario")
+            while not self._stop.is_set():
+                xerr.clear()
+                img = xlib.XGetImage(dpy, root, 0, 0, W, H,
+                                     0xFFFFFFFF, 2)      # ZPixmap
+                xlib.XSync(dpy, 0)                       # forza errori async
+                if xerr or not img:
+                    raise RuntimeError(
+                        "X11: XGetImage fallito (root non catturabile)")
+                try:
+                    im = img.contents
+                    bpp = im.bits_per_pixel // 8
+                    raw = ctypes.string_at(im.data,
+                                           im.bytes_per_line * im.height)
+                    arr = np.frombuffer(raw, np.uint8).reshape(
+                        im.height, im.bytes_per_line)
+                    px = arr[:, : im.width * bpp].reshape(
+                        im.height, im.width, bpp)
+                    # LSBFirst: B,G,R(,X); MSBFirst 32bpp: X,R,G,B;
+                    # MSBFirst 24bpp: R,G,B
+                    if im.byte_order == 1:
+                        ch = [1, 2, 3] if bpp >= 4 else [0, 1, 2]
+                    else:
+                        ch = [2, 1, 0]
+                    self.frame = px[:, :, ch][: ,: , :3].copy()
+                finally:
+                    xlib.XFree(im.data)
+                    xlib.XFree(img)
+                self._stop.wait(0.33)                    # ~3 fps
+        finally:
+            xlib.XCloseDisplay(dpy)
+
     def _run(self):
+        # su sessione X11 (XFCE ecc.) il portale ScreenCast tipicamente
+        # non esiste: si va diretti su XGetImage, senza consenso
+        if (os.environ.get("XDG_SESSION_TYPE") == "x11"
+                and os.environ.get("DISPLAY")):
+            try:
+                self._run_x11()
+            except Exception as e:
+                self.on_status(f"cattura schermo non disponibile: {e}")
+                log.exception("screen capture X11 fallita")
+            self.frame = None
+            return
         try:
             import gi
             gi.require_version("Gst", "1.0")
