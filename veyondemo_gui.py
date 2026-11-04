@@ -403,6 +403,8 @@ class DemoApp(Adw.Application):
         return False
 
     def _set_x11_window_icon(self):
+        if os.environ.get("VEYON_NO_X11_ICON"):
+            return False
         try:
             set_x11_window_icon(
                 self.win, os.path.join(HERE, "assets", "icon-admin.svg"))
