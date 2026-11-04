@@ -32,6 +32,7 @@ from demo_store import DemoStore, STORE_PATH, Settings, \
 from master_client import ClientService, Credentials, scan_subnet, wol
 from screen_capture import ScreenCapture
 from demo_server import DemoServer, new_token
+from window_icon import set_x11_window_icon
 
 log = logging.getLogger("veyondemo_gui")
 
@@ -50,10 +51,9 @@ def install_autostart():
             f.write("[Desktop Entry]\n"
                     "Type=Application\n"
                     "Name=Veyon Daemon\n"
-                    f"Exec={sys.executable} "
-                    f"{os.path.join(HERE, 'veyon_daemon.py')}\n"
-                    "NoDisplay=true\n"
-                    "X-GNOME-Autostart-enabled=true\n")
+                    f"Exec=\"{sys.executable}\" "
+                    f"\"{os.path.join(HERE, 'veyon_daemon.py')}\"\n"
+                    "NoDisplay=true\n")
     except OSError:
         pass
 
@@ -189,6 +189,13 @@ class DemoApp(Adw.Application):
         self.win.set_default_size(640, 560)
 
         header = Adw.HeaderBar()
+        # XFCE disegna già i controlli nella decorazione della finestra;
+        # evita di duplicarli nell'header Adwaita mantenendo il layout.
+        desktops = " ".join((os.environ.get("XDG_CURRENT_DESKTOP", ""),
+                             os.environ.get("DESKTOP_SESSION", ""))).lower()
+        if "xfce" in desktops:
+            header.set_show_start_title_buttons(False)
+            header.set_show_end_title_buttons(False)
         self.status_dot = Gtk.Image(icon_name="media-record-symbolic")
         self.status_dot.set_pixel_size(10)
         header.pack_start(self.status_dot)
@@ -312,6 +319,7 @@ class DemoApp(Adw.Application):
 
         self.win.connect("close-request", self._on_close)
         self.win.present()
+        GLib.idle_add(self._set_x11_window_icon)
         if self.args.minimized:
             self.win.minimize()
 
@@ -361,6 +369,14 @@ class DemoApp(Adw.Application):
         dlg.set_close_response("no")
         dlg.connect("response", self._on_daemon_response)
         dlg.present(self.win)
+        return False
+
+    def _set_x11_window_icon(self):
+        try:
+            set_x11_window_icon(
+                self.win, os.path.join(HERE, "assets", "icon-admin.svg"))
+        except Exception as e:
+            log.debug("icona finestra non impostata: %s", e)
         return False
 
     def _on_daemon_response(self, dlg, response):
@@ -1253,9 +1269,10 @@ def _install_desktop_entry():
                     "Type=Application\n"
                     "Name=Veyon (admin)\n"
                     "Comment=Cattura e mostra le presentazioni Veyon\n"
-                    "Icon=veyon-demo-admin\n"
-                    f"Exec={sys.executable} "
-                    f"{os.path.join(HERE, 'veyondemo_gui.py')}\n"
+                    f"Icon={os.path.join(HERE, 'assets', 'icon-admin.svg')}\n"
+                    f"StartupWMClass={APP_ID}\n"
+                    f"Exec=\"{sys.executable}\" "
+                    f"\"{os.path.join(HERE, 'veyondemo_gui.py')}\"\n"
                     "Terminal=false\n"
                     "Categories=Network;RemoteAccess;\n")
     except OSError:
