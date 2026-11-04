@@ -273,6 +273,10 @@ class ScreenCapture:
         xlib.XFree.argtypes = [ctypes.c_void_p]
         xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
         xlib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        xlib.XGetWindowAttributes.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.POINTER(XWindowAttributes)]
+        xlib.XGetWindowAttributes.restype = ctypes.c_int
 
         # gli errori X di default uccidono il processo: li trasformo in
         # eccezioni gestibili (es. XGetImage su root di XWayland)
