@@ -33,6 +33,9 @@ from master_client import ClientService, Credentials, scan_subnet, wol
 from screen_capture import ScreenCapture
 from demo_server import DemoServer, new_token
 from window_icon import set_x11_window_icon
+import recorder
+from recorder import PipeRecorder, X11GrabRecorder
+from meet_view import MeetPanel
 
 log = logging.getLogger("veyondemo_gui")
 
@@ -196,6 +199,11 @@ class DemoApp(Adw.Application):
         self.chat_wins = {}             # ip -> widget chat
         self.client_kind = {}           # ip -> {"name","ver"} | "veyon"
         self.client_status_txt = {}     # ip -> ultimo stato connessione
+        self.meet_panel = None          # MeetPanel (tab Meet)
+        self.screen_rec = None          # recorder registrazione schermo
+        self.screen_rec_cap = None      # ScreenCapture dedicato (Wayland)
+        self._screen_rec_path = None
+        self._rec_timer = None
 
     # ---- costruzione UI ------------------------------------------------------
 
@@ -238,6 +246,9 @@ class DemoApp(Adw.Application):
         demo_scroll.set_child(clamp)
         self.stack.add_titled_with_icon(demo_scroll, "demo", "Demo",
                                         "video-display-symbolic")
+        self.stack.add_titled_with_icon(self._build_meet_page(),
+                                        "meet", "Meet",
+                                        "camera-video-symbolic")
         self.stack.add_titled_with_icon(self._build_master_page(),
                                         "master", "Master",
                                         "system-users-symbolic")
@@ -525,6 +536,16 @@ class DemoApp(Adw.Application):
             self._add_client_row(ip)
         return scroll
 
+    # ---- pagina meet ---------------------------------------------------------
+
+    def _build_meet_page(self):
+        scroll = Gtk.ScrolledWindow()
+        clamp = Adw.Clamp(maximum_size=560)
+        self.meet_panel = MeetPanel(self, log_cb=self.log_line)
+        clamp.set_child(self.meet_panel)
+        scroll.set_child(clamp)
+        return scroll
+
     # ---- pagina impostazioni -------------------------------------------------
 
     def _build_settings_page(self):
@@ -576,6 +597,17 @@ class DemoApp(Adw.Application):
         self.rec_master_row.add_suffix(self.rec_master_sw)
         self.rec_master_row.set_activatable_widget(self.rec_master_sw)
         rec_grp.add(self.rec_master_row)
+
+        self.rec_file_row = Adw.ActionRow(
+            title="Salva su file",
+            subtitle="registra lo schermo in ~/Video/veyon-rec-*.mkv — OFF")
+        self.rec_file_row.add_prefix(Gtk.Image.new_from_icon_name(
+            "document-save-symbolic"))
+        self.rec_file_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.rec_file_sw.connect("notify::active", self._on_rec_file_sw)
+        self.rec_file_row.add_suffix(self.rec_file_sw)
+        self.rec_file_row.set_activatable_widget(self.rec_file_sw)
+        rec_grp.add(self.rec_file_row)
         content.append(rec_grp)
         return scroll
 
@@ -695,6 +727,66 @@ class DemoApp(Adw.Application):
             if f"{local_ipv4()}:11400" in self.demo_src.get_text():
                 self.demo_src.set_text("")
         self._maybe_stop_capture()
+
+    # ---- registrazione schermo su file ----------------------------------------
+
+    def _on_rec_file_sw(self, sw, _pspec):
+        if sw.get_active():
+            if not recorder.ffmpeg_ok():
+                self.log_line("registrazione: ffmpeg non trovato")
+                sw.set_active(False)
+                return
+            path = recorder.new_path("veyon-rec")
+            if recorder.is_x11():
+                self.screen_rec = X11GrabRecorder(
+                    path, size=recorder.x11_screen_size())
+                self.screen_rec.start()
+                self.log_line(f"registrazione schermo -> {path}")
+            else:
+                self._screen_rec_path = path
+                self._rec_timer = GLib.timeout_add(100, self._rec_push)
+                self.log_line("registrazione: avvio cattura "
+                              "(consenso portale se richiesto)…")
+            self.rec_file_row.set_subtitle(
+                f"→ {os.path.basename(path)} — REC")
+        else:
+            self._stop_screen_rec()
+
+    def _rec_push(self):
+        """Wayland: frame dal portale -> PipeRecorder. Riusa la cattura
+        condivisa se gia' attiva, altrimenti una dedicata."""
+        cap = self.capture or self.screen_rec_cap
+        if cap is None:
+            self.screen_rec_cap = ScreenCapture(on_status=self._cap_status)
+            self.screen_rec_cap.start()
+            cap = self.screen_rec_cap
+        fr = cap.get_frame()
+        if fr is None:
+            return True                 # consenso/frame non ancora pronti
+        if self.screen_rec is None:
+            h, w, _ = fr.shape
+            self.screen_rec = PipeRecorder(self._screen_rec_path, w, h,
+                                           fps=10)
+            self.screen_rec.start()
+            self.log_line(
+                f"registrazione schermo -> {self._screen_rec_path}")
+        self.screen_rec.push(fr)
+        return True
+
+    def _stop_screen_rec(self):
+        if self._rec_timer:
+            GLib.source_remove(self._rec_timer)
+            self._rec_timer = None
+        if self.screen_rec_cap:
+            self.screen_rec_cap.stop()
+            self.screen_rec_cap = None
+        if self.screen_rec:
+            self.screen_rec.stop()
+            self.log_line(
+                f"registrazione salvata in {self.screen_rec.path}")
+            self.screen_rec = None
+        self.rec_file_row.set_subtitle(
+            "registra lo schermo in ~/Video/veyon-rec-*.mkv — OFF")
 
     # ---- azioni sui client --------------------------------------------------
 
@@ -1582,6 +1674,9 @@ class DemoApp(Adw.Application):
             svc.stop_flag = True
         if self.demo_server:
             self.demo_server.stop()
+        if self.meet_panel:
+            self.meet_panel.cleanup()
+        self._stop_screen_rec()
         if self.capture:
             self.capture.stop()
         self.kill_viewer()

@@ -69,6 +69,76 @@ until you are back on that network.
 - TCP connectivity to the Veyon master on port 11100 (your host must be
   registered in the master's computer list)
 - GNOME, XFCE, or another GTK desktop; XFCE needs GTK4 and libadwaita runtime
+- Optional (Meet tab): `gir1.2-webkit-6.0` — embedded WebKitGTK browser
+- Optional (video recording): `ffmpeg` — writes H.264 `.mkv` files
+
+## Installation
+
+```bash
+git clone https://github.com/samuele-brusegan/veyon-demo-viewer.git
+cd veyon-demo-viewer
+python3 install_deps.py        # TUI: seleziona e installa ciò che manca
+python3 veyondemo_gui.py
+```
+
+`install_deps.py` detects the package manager (apt/dnf/pacman), shows
+each dependency with its installed/missing state, pre-selects what's
+missing and installs the selection via `sudo`. Use `--list` for a
+non-interactive status check.
+
+Manual install, per distro:
+
+```bash
+# Debian / Ubuntu / Kali
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-numpy \
+    gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire xdg-desktop-portal \
+    libx11-6 ffmpeg gir1.2-webkit-6.0
+
+# Fedora (ffmpeg requires RPM Fusion)
+sudo dnf install python3-gobject gtk4 libadwaita python3-numpy \
+    gstreamer1-plugins-base pipewire-gstreamer xdg-desktop-portal \
+    libX11 ffmpeg webkitgtk6.0
+
+# Arch
+sudo pacman -S python-gobject gtk4 libadwaita python-numpy \
+    gst-plugins-base gst-plugin-pipewire xdg-desktop-portal \
+    libx11 ffmpeg webkitgtk-6.0
+```
+
+Only GTK4/libadwaita/PyGObject and NumPy are strictly required — the
+other packages enable Wayland screen capture (PipeWire + portal), the
+Meet tab (WebKitGTK) and video recording (ffmpeg). On X11 sessions
+(XFCE, LXDE) screen capture works without PipeWire/portal.
+
+## Meet / Google Classroom
+
+The **Meet** tab embeds a dedicated browser window (WebKitGTK 6.0,
+persistent profile in `~/.local/share/veyon-demo-viewer/webkit`):
+
+1. **Apri** opens `classroom.google.com` — log in to Google there
+   (the session persists across restarts).
+2. **Aggiorna corsi** reads the course list from the open Classroom
+   page; double-clicking a course finds its Meet link and joins it.
+3. The meeting stays connected until you click **Esci** (or close the
+   Meet window). Auto-join clicks "Partecipa"/"Join now" for you.
+4. **Link Meet diretto** joins any `meet.google.com/…` URL, including
+   as a guest without login.
+5. The participants panel lists names scraped from the Meet DOM —
+   pinning a specific stream is done in Meet's own UI.
+6. **Registra riunione** records only the Meet window to `.mkv`:
+   on X11 via `ffmpeg -f x11grab -window_id`, on Wayland via the
+   ScreenCast portal (pick the Meet window in the system dialog).
+
+Note: Google sign-in inside embedded browsers can occasionally be
+refused depending on the account/2FA policy — if that happens, join
+via a direct Meet link as guest, which needs no login.
+
+## Screen recording
+
+Settings → **Salva su file** records the local screen to
+`~/Video/veyon-rec-*.mkv` (H.264). On X11 it uses `ffmpeg -f x11grab`;
+on Wayland it goes through the ScreenCast portal (consent dialog) and
+pipes frames into ffmpeg.
 
 The GUI keeps its Adwaita layout on XFCE. It uses XFCE's window controls,
 registers desktop entries against each GTK application ID, and publishes the
@@ -116,9 +186,10 @@ python3 test_e2e.py             # mock master + mock demo server, 16 checks
   the demo server's synchronization behavior).
 - The viewer never forces fullscreen: the demo's fullscreen/window flag is
   read for display purposes only.
-- This is an interoperability client: it only receives and displays
-  presentations. Your local screen is never shared (the master sees a black
-  framebuffer).
+- This is an interoperability client: it receives and displays
+  presentations. Your local screen is shared only if you enable
+  «Inviare al master/docente» or accept a share request (otherwise the
+  master sees a black framebuffer).
 
 ## License
 

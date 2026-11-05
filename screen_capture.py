@@ -51,8 +51,12 @@ def _save_restore_token(tok):
 class ScreenCapture:
     """Thread che gira il dialogo portal e la pipeline Gst."""
 
-    def __init__(self, on_status=None):
+    def __init__(self, on_status=None, source_types=1):
+        """source_types: bitmask portale — 1=monitor, 2=finestra, 3=entrambi.
+        Con 2 il dialogo di consenso permette di scegliere una finestra
+        (es. per registrare solo la finestra Meet su Wayland)."""
         self.on_status = on_status or (lambda t: log.info("%s", t))
+        self.source_types = source_types
         self.frame = None
         self._stop = threading.Event()
         self._thread = None
@@ -152,7 +156,7 @@ class ScreenCapture:
         session = str(res["session_handle"])
         self._session = session
 
-        opts = {"types": GLib.Variant("u", 1),          # monitor
+        opts = {"types": GLib.Variant("u", self.source_types),
                 "multiple": GLib.Variant("b", False),
                 "persist_mode": GLib.Variant("u", 2)}
         rt = _load_restore_token()
