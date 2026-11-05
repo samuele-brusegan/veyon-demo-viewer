@@ -5,6 +5,14 @@ Linux machine that **is not** an official Veyon client — without exposing your
 own screen, and in a normal, resizable, minimizable window even when the
 teacher presents fullscreen.
 
+## Screenshots
+
+| Demo — cattura daemon e presentazioni | Meet — Classroom e riunioni |
+|---|---|
+| ![Demo](docs/screenshots/demo.png) | ![Meet](docs/screenshots/meet.png) |
+| **Master — client e trasmissione demo** | **Impostazioni — master e registrazione** |
+| ![Master](docs/screenshots/master.png) | ![Impostazioni](docs/screenshots/settings.png) |
+
 ## How it works
 
 Veyon demos are push-based: when a teacher starts a presentation, the Veyon

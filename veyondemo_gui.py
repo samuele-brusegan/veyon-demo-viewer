@@ -40,7 +40,8 @@ from meet_view import MeetPanel
 log = logging.getLogger("veyondemo_gui")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-APP_ID = "dev.local.veyon-demo-gui"
+APP_ID = os.environ.get("VEYON_APP_ID", "dev.local.veyon-demo-gui")
+DESKTOP_APP_ID = "dev.local.veyon-demo-gui"   # id fisso del .desktop
 AUTOSTART_PATH = os.path.expanduser(
     "~/.config/autostart/dev.local.veyon-daemon.desktop")
 DAEMON_ASKED = os.path.join(os.path.dirname(STORE_PATH), "daemon-asked")
@@ -392,18 +393,56 @@ class DemoApp(Adw.Application):
         self._apply_record_demo()
         self._apply_record_master()
 
+        # debug/screenshot: VEYON_TAB=demo|meet|master|settings,
+        # VEYON_SHOT=path.png salva uno snapshot della finestra ed esce
+        tab = os.environ.get("VEYON_TAB")
+        if tab and self.stack.get_child_by_name(tab) is not None:
+            self.stack.set_visible_child_name(tab)
+        shot = os.environ.get("VEYON_SHOT")
+        if shot:
+            GLib.timeout_add(1600, self._debug_shot, shot)
+
         if not os.path.exists(AUTOSTART_PATH) and \
                 not os.path.exists(DAEMON_ASKED):
             GLib.idle_add(self._ask_daemon)
 
     # ---- daemon autostart ---------------------------------------------------
 
+    def _debug_shot(self, path):
+        """VEYON_SHOT: snapshot del contenuto finestra -> PNG, poi esce."""
+        try:
+            paintable = Gtk.WidgetPaintable.new(self.win)
+            snap = Gtk.Snapshot()
+            paintable.snapshot(snap, self.win.get_width(),
+                               self.win.get_height())
+            node = snap.to_node()
+            rend = self.win.get_native().get_renderer()
+            tex = rend.render_texture(node, None)
+            tex.save_to_png(path)
+            print(f"shot salvato: {path}")
+        except Exception as e:
+            print(f"shot fallito: {e}")
+        GLib.timeout_add(300, self.quit)
+        return False
+
     def _ask_daemon(self):
         dlg = Adw.AlertDialog(
-            heading="Cattura in background?",
-            body="Vuoi che i token demo vengano catturati anche quando "
-                 "l'app è chiusa? Il daemon minimale (veyon_daemon.py) "
-                 "verrà avviato automaticamente a ogni login.")
+            heading="Catturare le demo anche ad app chiusa?",
+            body="Il daemon è un piccolo servizio in background che:\n\n"
+                 "• si mette in ascolto sulla porta 11100 fingendosi "
+                 "un client Veyon\n"
+                 "• cattura le presentazioni avviate dal docente anche "
+                 "quando questa app è chiusa\n"
+                 "• salva i token nello store condiviso: alla prossima "
+                 "apertura trovi le demo già in elenco\n\n"
+                 "Viene avviato automaticamente a ogni login (voce in "
+                 "~/.config/autostart) e puoi disattivarlo in ogni "
+                 "momento con lo switch «Daemon al login».\n\n"
+                 "Non condivide il tuo schermo di sua iniziativa, ma "
+                 "senza interfaccia non può chiederti conferma: se un "
+                 "client custom richiede la condivisione, la accetta "
+                 "automaticamente. Senza daemon, le demo vengono "
+                 "intercettate solo mentre l'app è aperta.")
         dlg.add_response("no", "Non ora")
         dlg.add_response("yes", "Attiva al login")
         dlg.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
@@ -1711,13 +1750,13 @@ def _install_desktop_entry():
     apps = os.path.expanduser("~/.local/share/applications")
     try:
         os.makedirs(apps, exist_ok=True)
-        with open(os.path.join(apps, APP_ID + ".desktop"), "w") as f:
+        with open(os.path.join(apps, DESKTOP_APP_ID + ".desktop"), "w") as f:
             f.write("[Desktop Entry]\n"
                     "Type=Application\n"
                     "Name=Veyon (admin)\n"
                     "Comment=Cattura e mostra le presentazioni Veyon\n"
                     f"Icon={os.path.join(HERE, 'assets', 'icon-admin.svg')}\n"
-                    f"StartupWMClass={APP_ID}\n"
+                    f"StartupWMClass={DESKTOP_APP_ID}\n"
                     f"Exec=\"{sys.executable}\" "
                     f"\"{os.path.join(HERE, 'veyondemo_gui.py')}\"\n"
                     "Terminal=false\n"
